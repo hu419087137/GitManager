@@ -2,6 +2,9 @@
 #include <QTextCharFormat>
 #include <QTextDocument>
 #include <QFont>
+#include <QContextMenuEvent>
+#include <QMenu>
+#include "../core/DiffParser.h"
 
 // ============================================================
 // DiffWidget
@@ -20,15 +23,34 @@ DiffWidget::DiffWidget(QWidget* parent)
     _highlighter = new DiffHighlighter(document());
 }
 
-void DiffWidget::setDiff(const QString& diffText)
+void DiffWidget::setDiff(const QString& diffText, int actions)
 {
+    _actions = actions;
     setPlainText(diffText);
     moveCursor(QTextCursor::Start);
 }
 
 void DiffWidget::clearDiff()
 {
+    _actions = NoAction;
     clear();
+}
+
+void DiffWidget::contextMenuEvent(QContextMenuEvent* event)
+{
+    QMenu* menu = createStandardContextMenu();
+    const QString patch = Git::DiffParser::hunkAtLine(toPlainText(), cursorForPosition(event->pos()).blockNumber());
+    if (!patch.isEmpty()) {
+        menu->addSeparator();
+        if (_actions & StageAction)
+            menu->addAction(QStringLiteral("Stage Hunk"), [this, patch] { emit sigHunkActionRequested(patch, 0); });
+        if (_actions & UnstageAction)
+            menu->addAction(QStringLiteral("Unstage Hunk"), [this, patch] { emit sigHunkActionRequested(patch, 1); });
+        if (_actions & DiscardAction)
+            menu->addAction(QStringLiteral("Discard Hunk"), [this, patch] { emit sigHunkActionRequested(patch, 2); });
+    }
+    menu->exec(event->globalPos());
+    delete menu;
 }
 
 // ============================================================

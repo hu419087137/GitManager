@@ -1,7 +1,12 @@
 include(SanitizeBool)
 
 # We try to find any packages our backends might use
-find_package(OpenSSL)
+if(TARGET OpenSSL::SSL AND TARGET OpenSSL::Crypto)
+	set(OPENSSL_FOUND TRUE)
+	set(OPENSSL_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
+else()
+	find_package(OpenSSL)
+endif()
 find_package(mbedTLS)
 if(CMAKE_SYSTEM_NAME MATCHES "Darwin" OR CMAKE_SYSTEM_NAME MATCHES "iOS")
 	find_package(Security)

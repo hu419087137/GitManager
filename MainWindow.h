@@ -36,6 +36,12 @@ public:
 private slots:
     // ---- 工具栏操作 ----
     void slotOpenRepo();
+    void slotInitRepo();
+    void slotCloneRepo();
+    void slotFetch();
+    void slotRemote();
+    void slotStash();
+    void slotRepositoryOperation();
     void slotRefresh();
     void slotPull();
     void slotPush();
@@ -53,6 +59,8 @@ private slots:
     void slotStageAll();
     void slotUnstageAll();
     void slotIgnoreFile(const QString& filePath);
+    void slotDiscardFile(const QString& filePath, bool untracked);
+    void slotResolveFile(const QString& filePath, bool ours);
     void slotCheckoutBranch(const QString& branchName);
     void slotDeleteBranch(const QString& branchName, bool force);
     void slotCreateBranch(const QString& fromBranch);
@@ -95,6 +103,7 @@ private:
     QAction*           _cancelAction     {nullptr};
     QList<QAction*>    _repositoryActions;
     Git::RepositoryState _state;
+    QStringList _stashes;
 };
 
 #endif // MAINWINDOW_H

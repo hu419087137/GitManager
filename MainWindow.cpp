@@ -19,6 +19,8 @@
 #include <QVBoxLayout>
 #include <QSettings>
 #include <QDir>
+#include <QLineEdit>
+#include <QRegularExpression>
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
@@ -51,24 +53,36 @@ void MainWindow::setupToolBar()
     tb->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
 
     auto* openAction    = tb->addAction(QStringLiteral("Open Repo"));
+    auto* initAction    = tb->addAction(QStringLiteral("Init"));
+    auto* cloneAction   = tb->addAction(QStringLiteral("Clone"));
     auto* refreshAction = tb->addAction(QStringLiteral("Refresh"));
     tb->addSeparator();
     auto* pullAction    = tb->addAction(QStringLiteral("Pull"));
+    auto* fetchAction   = tb->addAction(QStringLiteral("Fetch"));
     auto* pushAction    = tb->addAction(QStringLiteral("Push"));
     tb->addSeparator();
     auto* commitAction  = tb->addAction(QStringLiteral("Commit"));
+    auto* stashAction   = tb->addAction(QStringLiteral("Stash"));
+    auto* remoteAction  = tb->addAction(QStringLiteral("Remote"));
+    auto* operationAction = tb->addAction(QStringLiteral("Continue/Abort"));
     _cancelAction       = tb->addAction(QStringLiteral("Cancel"));
     _cancelAction->setEnabled(false);
-    _repositoryActions = {refreshAction, pullAction, pushAction, commitAction};
+    _repositoryActions = {refreshAction, pullAction, fetchAction, pushAction, commitAction, stashAction, remoteAction, operationAction};
 
     _repoLabel = new QLabel(QStringLiteral("  No repository"), this);
     statusBar()->addPermanentWidget(_repoLabel);
 
     connect(openAction,    &QAction::triggered, this, &MainWindow::slotOpenRepo);
+    connect(initAction, &QAction::triggered, this, &MainWindow::slotInitRepo);
+    connect(cloneAction, &QAction::triggered, this, &MainWindow::slotCloneRepo);
     connect(refreshAction, &QAction::triggered, this, &MainWindow::slotRefresh);
     connect(pullAction,    &QAction::triggered, this, &MainWindow::slotPull);
+    connect(fetchAction, &QAction::triggered, this, &MainWindow::slotFetch);
     connect(pushAction,    &QAction::triggered, this, &MainWindow::slotPush);
     connect(commitAction,  &QAction::triggered, this, &MainWindow::slotCommit);
+    connect(stashAction, &QAction::triggered, this, &MainWindow::slotStash);
+    connect(remoteAction, &QAction::triggered, this, &MainWindow::slotRemote);
+    connect(operationAction, &QAction::triggered, this, &MainWindow::slotRepositoryOperation);
     connect(_cancelAction, &QAction::triggered, this, &MainWindow::slotCancelOperation);
 }
 
@@ -135,14 +149,41 @@ void MainWindow::connectSignals()
     connect(_git, &Git::GitManager::sigStateReady,
             this, &MainWindow::slotStateReady);
     connect(_git, &Git::GitManager::sigDiffReady, this,
-            [this](const QString& diff, const QString&) {
-        _diffWidget->setDiff(diff);
+            [this](const QString& diff, const QString&, bool staged,
+                   bool hunkActionsEnabled) {
+        const int actions = !hunkActionsEnabled ? DiffWidget::NoAction
+            : staged ? DiffWidget::UnstageAction
+                     : DiffWidget::StageAction | DiffWidget::DiscardAction;
+        _diffWidget->setDiff(diff, actions);
         _rightTabs->setCurrentWidget(_diffWidget);
     });
     connect(_git, &Git::GitManager::sigOperationFinished,
             this, &MainWindow::slotOperationFinished);
     connect(_git, &Git::GitManager::sigBusyChanged,
             this, &MainWindow::slotBusyChanged);
+    connect(_git, &Git::GitManager::sigStashesReady, this, [this](const QStringList& entries) {
+        _stashes = entries;
+        if (entries.isEmpty()) QMessageBox::information(this, QStringLiteral("Stashes"), QStringLiteral("No stashes."));
+        else {
+            bool ok=false;
+            const QString item=QInputDialog::getItem(this,QStringLiteral("Stashes"),QStringLiteral("Select stash:"),entries,0,false,&ok);
+            if (!ok) return;
+            const QString ref=item.section('\t',0,0);
+            const QStringList actions={QStringLiteral("Apply"),QStringLiteral("Pop"),QStringLiteral("Drop")};
+            const QString action=QInputDialog::getItem(this,QStringLiteral("Stash Action"),QStringLiteral("Action:"),actions,0,false,&ok);
+            if (!ok) return;
+            if(action==actions[0])_git->stashApply(ref,false);
+            else if(action==actions[1])_git->stashApply(ref,true);
+            else if(QMessageBox::question(this,QStringLiteral("Drop Stash"),QStringLiteral("Delete %1 permanently?").arg(ref))==QMessageBox::Yes)_git->stashDrop(ref);
+        }
+    });
+    connect(_diffWidget, &DiffWidget::sigHunkActionRequested, this,
+            [this](const QString& patch, int action) {
+        if (action == 2 && QMessageBox::warning(this, QStringLiteral("Discard Hunk"),
+            QStringLiteral("Discard the selected hunk permanently?"), QMessageBox::Yes | QMessageBox::Cancel,
+            QMessageBox::Cancel) != QMessageBox::Yes) return;
+        _git->applyPatch(patch, action == 0 || action == 1, action == 1 || action == 2);
+    });
 
     connect(_repoList, &RepoListWidget::sigRepoSwitchRequested,
             this, &MainWindow::slotRepoSelected);
@@ -162,6 +203,10 @@ void MainWindow::connectSignals()
             this, &MainWindow::slotUnstageAll);
     connect(_statusWidget, &StatusWidget::sigIgnoreRequested,
             this, &MainWindow::slotIgnoreFile);
+    connect(_statusWidget, &StatusWidget::sigDiscardRequested,
+            this, &MainWindow::slotDiscardFile);
+    connect(_statusWidget, &StatusWidget::sigResolveRequested,
+            this, &MainWindow::slotResolveFile);
 
     connect(_branchList, &BranchListWidget::sigCheckoutRequested,
             this, &MainWindow::slotCheckoutBranch);
@@ -209,7 +254,11 @@ void MainWindow::slotPush()
 {
     if (!_git->isValid()) return;
     showStatus(QStringLiteral("Pushing..."));
-    _git->push();
+    if (!_state.unborn && _state.upstream.isEmpty()) {
+        const QString remote = QInputDialog::getText(this, QStringLiteral("Publish Branch"),
+            QStringLiteral("Remote name:"), QLineEdit::Normal, QStringLiteral("origin"));
+        if (!remote.trimmed().isEmpty()) _git->pushSetUpstream(remote.trimmed(), _state.headName);
+    } else _git->push();
 }
 
 void MainWindow::slotCommit()
@@ -237,7 +286,101 @@ void MainWindow::slotCommit()
     if (msg.isEmpty())
         return;
 
-    _git->commit(msg);
+    _git->commit(msg, dlg.amend(), dlg.signoff());
+}
+
+void MainWindow::slotInitRepo()
+{
+    const QString path = QFileDialog::getExistingDirectory(this, QStringLiteral("Initialize Repository"), QDir::homePath());
+    if (!path.isEmpty()) _git->initRepository(path);
+}
+
+void MainWindow::slotCloneRepo()
+{
+    const QString url = QInputDialog::getText(this, QStringLiteral("Clone Repository"), QStringLiteral("Repository URL:"));
+    if (url.trimmed().isEmpty()) return;
+    const QString parent = QFileDialog::getExistingDirectory(this, QStringLiteral("Clone Into"), QDir::homePath());
+    if (parent.isEmpty()) return;
+    QString name = url.section('/', -1);
+    name.remove(QRegularExpression(QStringLiteral("\\.git$")));
+    _git->cloneRepository(url.trimmed(), QDir(parent).filePath(name));
+}
+
+void MainWindow::slotFetch() { if (_git->isValid()) _git->fetch(true); }
+
+void MainWindow::slotRemote()
+{
+    const QStringList actions = {
+        QStringLiteral("Add remote"),
+        QStringLiteral("Remove remote"),
+        QStringLiteral("Set session credentials"),
+        QStringLiteral("Clear session credentials")
+    };
+    bool selected = false;
+    const QString action = QInputDialog::getItem(this, QStringLiteral("Remote"), QStringLiteral("Action:"), actions, 0, false, &selected);
+    if (!selected) return;
+    if (action == actions[2]) {
+        const QString username = QInputDialog::getText(
+            this, QStringLiteral("Remote Credentials"), QStringLiteral("Username:"));
+        bool accepted = false;
+        const QString secret = QInputDialog::getText(
+            this, QStringLiteral("Remote Credentials"),
+            QStringLiteral("Password or access token:"), QLineEdit::Password,
+            {}, &accepted);
+        if (accepted) {
+            _git->setRemoteCredentials(username, secret);
+            showStatus(QStringLiteral("Remote credentials set for this session."));
+        }
+        return;
+    }
+    if (action == actions[3]) {
+        _git->clearRemoteCredentials();
+        showStatus(QStringLiteral("Session credentials cleared."));
+        return;
+    }
+    const QString name = QInputDialog::getText(this, QStringLiteral("Add Remote"), QStringLiteral("Remote name:"), QLineEdit::Normal, QStringLiteral("origin"));
+    if (name.trimmed().isEmpty()) return;
+    if (action == actions[1]) {
+        if (QMessageBox::question(this, QStringLiteral("Remove Remote"), QStringLiteral("Remove remote '%1'?").arg(name)) == QMessageBox::Yes)
+            _git->removeRemote(name.trimmed());
+        return;
+    }
+    const QString url = QInputDialog::getText(this, QStringLiteral("Add Remote"), QStringLiteral("Remote URL:"));
+    if (!url.trimmed().isEmpty()) _git->addRemote(name.trimmed(), url.trimmed());
+}
+
+void MainWindow::slotStash()
+{
+    const QStringList actions = {QStringLiteral("Create stash"), QStringLiteral("Manage stashes")};
+    bool ok = false;
+    const QString action = QInputDialog::getItem(this, QStringLiteral("Stash"), QStringLiteral("Action:"), actions, 0, false, &ok);
+    if (!ok) return;
+    if (action == actions[0]) {
+        const QString message = QInputDialog::getText(this, QStringLiteral("Create Stash"), QStringLiteral("Message:"));
+        _git->stashPush(message, true);
+    } else _git->listStashes();
+}
+
+void MainWindow::slotRepositoryOperation()
+{
+    const QStringList actions={QStringLiteral("Continue merge"),QStringLiteral("Abort merge"),
+        QStringLiteral("Continue rebase"),QStringLiteral("Abort rebase"),
+        QStringLiteral("Continue cherry-pick"),QStringLiteral("Abort cherry-pick")};
+    bool ok=false; const QString action=QInputDialog::getItem(this,QStringLiteral("Repository Operation"),QStringLiteral("Action:"),actions,0,false,&ok);
+    if(!ok)return;
+    const QString op=action.contains("merge")?QStringLiteral("merge"):action.contains("rebase")?QStringLiteral("rebase"):QStringLiteral("cherry-pick");
+    if(action.startsWith("Continue")) {
+        _git->continueOperation(op);
+    } else {
+        if (QMessageBox::warning(
+                this, QStringLiteral("Abort Repository Operation"),
+                QStringLiteral("Abort the active %1 operation and restore its starting state? "
+                               "Tracked changes created by the operation will be discarded; "
+                               "untracked files are preserved.").arg(op),
+                QMessageBox::Yes | QMessageBox::Cancel,
+                QMessageBox::Cancel) == QMessageBox::Yes)
+            _git->abortOperation(op);
+    }
 }
 
 void MainWindow::slotCancelOperation() { _git->cancelAll(); }
@@ -366,6 +509,22 @@ void MainWindow::refresh()
 {
     showStatus(QStringLiteral("Refreshing…"));
     _git->refresh();
+}
+
+void MainWindow::slotDiscardFile(const QString& filePath, bool untracked)
+{
+    const QString text = untracked ? QStringLiteral("Delete untracked file '%1' permanently?").arg(filePath)
+                                   : QStringLiteral("Discard all unstaged changes in '%1'?").arg(filePath);
+    if (QMessageBox::warning(this, QStringLiteral("Confirm Destructive Operation"), text,
+                             QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes) return;
+    if (untracked) _git->removeUntracked(filePath); else _git->discardFile(filePath);
+}
+
+void MainWindow::slotResolveFile(const QString& filePath, bool ours)
+{
+    if (QMessageBox::question(this, QStringLiteral("Resolve Conflict"),
+        QStringLiteral("Replace '%1' with the %2 version?").arg(filePath, ours ? QStringLiteral("current") : QStringLiteral("incoming"))) == QMessageBox::Yes)
+        _git->resolveConflict(filePath, ours);
 }
 
 void MainWindow::slotRepositoryOpened(const QString& path, bool success, const QString& error)

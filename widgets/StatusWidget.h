@@ -46,6 +46,8 @@ signals:
 
     /** @brief 将文件加入 .gitignore */
     void sigIgnoreRequested(const QString& filePath);
+    void sigDiscardRequested(const QString& filePath, bool untracked);
+    void sigResolveRequested(const QString& filePath, bool ours);
 
 private slots:
     void slotItemChanged(QListWidgetItem* item);

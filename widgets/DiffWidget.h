@@ -5,6 +5,7 @@
 #include <QSyntaxHighlighter>
 
 class DiffHighlighter;
+class QContextMenuEvent;
 
 /**
  * @brief 差异内容展示控件
@@ -16,16 +17,30 @@ class DiffWidget : public QPlainTextEdit {
     Q_OBJECT
 
 public:
+    enum Action {
+        NoAction = 0,
+        StageAction = 1,
+        UnstageAction = 2,
+        DiscardAction = 4
+    };
+
     explicit DiffWidget(QWidget* parent = nullptr);
 
     /** @brief 显示 diff 文本 */
-    void setDiff(const QString& diffText);
+    void setDiff(const QString& diffText, int actions = NoAction);
 
     /** @brief 清空内容 */
     void clearDiff();
 
+signals:
+    void sigHunkActionRequested(const QString& patch, int action);
+
+protected:
+    void contextMenuEvent(QContextMenuEvent* event) override;
+
 private:
     DiffHighlighter* _highlighter {nullptr};
+    int _actions {NoAction};
 };
 
 // ============================================================

@@ -1,58 +1,173 @@
 #include "GitManager.h"
-#include "parsers/BranchParser.h"
-#include "parsers/StatusParser.h"
-#include <QDateTime>
+
+#include <QtConcurrent>
 #include <QDir>
 #include <QFile>
+#include <QFutureWatcher>
+#include <QPointer>
+#include <QRegularExpression>
 #include <QTextStream>
 
 namespace Git {
+
 namespace {
 
-const QByteArray kRecordSeparator("---COMMIT_BEGIN---");
-
-QString resultMessage(const GitResult& result)
+QString operationLabel(const QString& operation)
 {
-    QString detail = QString::fromUtf8(result.standardError).trimmed();
-    if (detail.isEmpty()) {
-        switch (result.error) {
-        case GitError::FailedToStart: detail = QStringLiteral("无法启动 git，请检查 PATH。"); break;
-        case GitError::TimedOut: detail = QStringLiteral("Git 命令执行超时。"); break;
-        case GitError::Cancelled: detail = QStringLiteral("操作已取消。"); break;
-        case GitError::NonZeroExit: detail = QStringLiteral("Git 命令失败。"); break;
-        default: break;
-        }
-    }
-    return QStringLiteral("%1\n命令：%2\n退出码：%3")
-        .arg(detail, GitCommandRunner::formatCommand(result.arguments))
-        .arg(result.exitCode);
+    return QStringLiteral("libgit2: %1").arg(operation);
 }
 
 } // namespace
 
 GitManager::GitManager(QObject* parent)
-    : QObject(parent), _runner(this)
+    : QObject(parent)
 {
-    qRegisterMetaType<GitResult>();
     qRegisterMetaType<RepositoryState>();
+}
 
-    connect(&_runner, &GitCommandRunner::sigStarted, this,
-            [this](quint64 id, const QString&, const QString& command) {
-        _contexts[id].command = command;
-        emit sigCommandStarted(command);
+GitManager::~GitManager()
+{
+    if (_activeCancelFlag)
+        _activeCancelFlag->store(true);
+}
+
+void GitManager::setRemoteCredentials(const QString& username,
+                                      const QString& secret)
+{
+    _credentials.username = username;
+    _credentials.secret = secret;
+}
+
+void GitManager::clearRemoteCredentials()
+{
+    _credentials = {};
+}
+
+void GitManager::enqueue(const QString& operation,
+                         std::function<TaskResult(LibGit2Backend&)> work,
+                         bool requiresRepository,
+                         bool reportCompletion,
+                         bool refreshAfter,
+                         bool reportError)
+{
+    Task task;
+    task.operation = operation;
+    task.repositoryPath = _repoPath;
+    task.generation = _generation;
+    task.work = std::move(work);
+    task.cancelFlag = std::make_shared<std::atomic_bool>(false);
+    task.credentials = _credentials;
+    task.requiresRepository = requiresRepository;
+    task.reportCompletion = reportCompletion;
+    task.refreshAfter = refreshAfter;
+    task.reportError = reportError;
+    _tasks.enqueue(std::move(task));
+    startNext();
+}
+
+void GitManager::startNext()
+{
+    if (_busy || _tasks.isEmpty())
+        return;
+
+    _busy = true;
+    const Task task = _tasks.dequeue();
+    _activeCancelFlag = task.cancelFlag;
+    emit sigBusyChanged(true);
+    emit sigCommandStarted(operationLabel(task.operation));
+
+    auto* watcher = new QFutureWatcher<TaskResult>(this);
+    connect(watcher, &QFutureWatcher<TaskResult>::finished, this,
+            [this, watcher, task] {
+        const TaskResult result = watcher->result();
+        watcher->deleteLater();
+
+        const bool cancelled = task.cancelFlag->load();
+        const bool sameRepository = task.repositoryPath == _repoPath;
+        const bool current = task.generation == _generation && sameRepository;
+        const bool success = !cancelled && result.error.isEmpty();
+        emit sigCommandRun(operationLabel(task.operation), result.error, success);
+
+        _busy = false;
+        _activeCancelFlag.reset();
+
+        if (current && !cancelled) {
+            if (result.apply && (result.error.isEmpty() || result.applyOnError))
+                result.apply(*this);
+
+            if (!result.error.isEmpty()) {
+                if (task.reportError)
+                    emit sigError(result.error);
+                if (task.reportCompletion)
+                    emit sigOperationFinished(task.operation, false, result.error);
+            } else {
+                if (task.reportCompletion)
+                    emit sigOperationFinished(task.operation, true, QStringLiteral("完成"));
+                if (task.refreshAfter)
+                    refresh();
+            }
+        } else if (cancelled && sameRepository && _isValid) {
+            emit sigOperationFinished(task.operation, false,
+                                      QStringLiteral("操作已取消"));
+            refresh();
+        }
+
+        if (!_busy) {
+            if (_tasks.isEmpty())
+                emit sigBusyChanged(false);
+            else
+                startNext();
+        }
     });
-    connect(&_runner, &GitCommandRunner::sigOutput, this,
-            [this](quint64 id, const QByteArray& data, bool error) {
-        const QString operation = _contexts.value(id).operation;
-        if (!operation.startsWith(QStringLiteral("refresh-"))
-            && !operation.startsWith(QStringLiteral("diff-"))
-            && operation != QStringLiteral("open"))
-            emit sigCommandOutput(QString::fromUtf8(data), error);
-    });
-    connect(&_runner, &GitCommandRunner::sigFinished,
-            this, &GitManager::handleResult);
-    connect(&_runner, &GitCommandRunner::sigBusyChanged,
-            this, &GitManager::sigBusyChanged);
+
+    const QPointer<GitManager> receiver(this);
+    watcher->setFuture(QtConcurrent::run([task, receiver]() -> TaskResult {
+        LibGit2Backend backend;
+        backend.setCancelFlag(task.cancelFlag.get());
+        backend.setCredentials(task.credentials);
+        backend.setProgressCallback([receiver](const QString& message, int percent) {
+            if (!receiver)
+                return;
+            const QString text = percent >= 0
+                ? QStringLiteral("%1 (%2%)").arg(message).arg(percent)
+                : message;
+            QMetaObject::invokeMethod(receiver, [receiver, text] {
+                if (!receiver)
+                    return;
+                emit receiver->sigInfo(text);
+                emit receiver->sigCommandOutput(text + QLatin1Char('\n'), false);
+            }, Qt::QueuedConnection);
+        });
+
+        TaskResult result;
+        if (task.cancelFlag->load())
+            return result;
+        if (task.requiresRepository
+            && !backend.open(task.repositoryPath, &result.error))
+            return result;
+        result = task.work(backend);
+        return result;
+    }));
+}
+
+void GitManager::runBoolean(const QString& operation,
+                            std::function<bool(LibGit2Backend&, QString*)> work,
+                            bool refreshAfter,
+                            bool refreshOnError)
+{
+    enqueue(operation, [work = std::move(work), refreshOnError](LibGit2Backend& backend) {
+        TaskResult result;
+        if (!work(backend, &result.error) && result.error.isEmpty())
+            result.error = QStringLiteral("libgit2 操作失败。");
+        if (refreshOnError && !result.error.isEmpty()) {
+            const RepositoryState state = backend.snapshot(nullptr);
+            result.applyOnError = true;
+            result.apply = [state](GitManager& manager) {
+                emit manager.sigStateReady(state);
+            };
+        }
+        return result;
+    }, true, true, refreshAfter);
 }
 
 void GitManager::openRepository(const QString& path)
@@ -61,222 +176,319 @@ void GitManager::openRepository(const QString& path)
     _repoPath = QDir(path).absolutePath();
     _isValid = false;
     ++_generation;
-    run(QStringLiteral("open"), {QStringLiteral("rev-parse"), QStringLiteral("--show-toplevel")});
+    const QString requestedPath = _repoPath;
+    enqueue(QStringLiteral("open"), [requestedPath](LibGit2Backend& backend) {
+        TaskResult result;
+        const bool ok = backend.open(requestedPath, &result.error);
+        const QString root = ok ? backend.rootPath() : requestedPath;
+        result.applyOnError = true;
+        result.apply = [ok, root, error = result.error](GitManager& manager) {
+            manager._isValid = ok;
+            if (ok)
+                manager._repoPath = root;
+            emit manager.sigRepositoryOpened(manager._repoPath, ok, error);
+            if (ok)
+                manager.refresh();
+        };
+        return result;
+    }, false, false, false, false);
+}
+
+void GitManager::initRepository(const QString& path)
+{
+    cancelAll();
+    _repoPath = QDir(path).absolutePath();
+    _isValid = false;
+    ++_generation;
+    const QString requestedPath = _repoPath;
+    enqueue(QStringLiteral("init"), [requestedPath](LibGit2Backend& backend) {
+        TaskResult result;
+        const bool ok = backend.initialize(requestedPath, &result.error);
+        result.applyOnError = true;
+        result.apply = [ok, requestedPath, error = result.error](GitManager& manager) {
+            manager._isValid = ok;
+            emit manager.sigRepositoryOpened(requestedPath, ok, error);
+            if (ok)
+                manager.refresh();
+        };
+        return result;
+    }, false, false, false, false);
+}
+
+void GitManager::cloneRepository(const QString& url, const QString& path)
+{
+    cancelAll();
+    _repoPath = QDir(path).absolutePath();
+    _isValid = false;
+    ++_generation;
+    const QString requestedPath = _repoPath;
+    enqueue(QStringLiteral("clone"), [url, requestedPath](LibGit2Backend& backend) {
+        TaskResult result;
+        const bool ok = backend.clone(url, requestedPath, &result.error);
+        result.applyOnError = true;
+        result.apply = [ok, requestedPath, error = result.error](GitManager& manager) {
+            manager._isValid = ok;
+            emit manager.sigRepositoryOpened(requestedPath, ok, error);
+            if (ok)
+                manager.refresh();
+        };
+        return result;
+    }, false, false, false, false);
 }
 
 void GitManager::refresh()
 {
     if (!_isValid)
         return;
-    ++_generation;
-    _pendingState = {};
-    _pendingState.rootPath = _repoPath;
-    _pendingRefreshParts = 3;
-    run(QStringLiteral("refresh-status"), {QStringLiteral("-c"), QStringLiteral("core.quotepath=false"),
-        QStringLiteral("status"), QStringLiteral("--porcelain=v2"), QStringLiteral("-z"),
-        QStringLiteral("--branch"), QStringLiteral("--untracked-files=all")});
-    run(QStringLiteral("refresh-log"), {QStringLiteral("log"), QStringLiteral("--topo-order"),
-        QStringLiteral("--format=---COMMIT_BEGIN---%n%H%n%h%n%P%n%an%n%aI%n%s%n%D"),
-        QStringLiteral("-n1000")});
-    run(QStringLiteral("refresh-branches"), {QStringLiteral("for-each-ref"),
-        QStringLiteral("--format=%(refname)%09%(refname:short)%09%(objectname:short)%09%(upstream:short)%09%(upstream:track,nobracket)%00"),
-        QStringLiteral("refs/heads"), QStringLiteral("refs/remotes")});
+    enqueue(QStringLiteral("refresh"), [](LibGit2Backend& backend) {
+        TaskResult result;
+        const RepositoryState state = backend.snapshot(&result.error);
+        result.apply = [state](GitManager& manager) {
+            emit manager.sigStateReady(state);
+        };
+        return result;
+    });
 }
 
 void GitManager::cancelAll()
 {
-    _runner.cancelAll();
-    _contexts.clear();
-    _pendingRefreshParts = 0;
+    if (_activeCancelFlag)
+        _activeCancelFlag->store(true);
+    _tasks.clear();
+    ++_generation;
 }
 
-void GitManager::fetchFileDiff(const QString& filePath, bool staged, bool untracked)
+void GitManager::fetchFileDiff(const QString& path, bool staged, bool untracked)
 {
-    QStringList args;
-    QString operation = QStringLiteral("diff-file:") + filePath;
-    if (untracked) {
-#ifdef Q_OS_WIN
-        args = {QStringLiteral("diff"), QStringLiteral("--no-index"), QStringLiteral("--"),
-                QStringLiteral("NUL"), filePath};
-#else
-        args = {QStringLiteral("diff"), QStringLiteral("--no-index"), QStringLiteral("--"),
-                QStringLiteral("/dev/null"), filePath};
-#endif
-        operation = QStringLiteral("diff-untracked:") + filePath;
-    } else {
-        args = {QStringLiteral("diff")};
-        if (staged) args << QStringLiteral("--cached");
-        args << QStringLiteral("--") << filePath;
-    }
-    run(operation, args);
+    enqueue(QStringLiteral("diff-file"), [path, staged, untracked](LibGit2Backend& backend) {
+        TaskResult result;
+        const QString diff = backend.fileDiff(path, staged, untracked, &result.error);
+        result.apply = [diff, path, staged](GitManager& manager) {
+            emit manager.sigDiffReady(diff, path, staged, true);
+        };
+        return result;
+    });
 }
 
 void GitManager::fetchCommitDiff(const QString& hash)
 {
-    run(QStringLiteral("diff-commit:") + hash.left(8),
-        {QStringLiteral("show"), QStringLiteral("--stat"), QStringLiteral("-p"), hash});
+    enqueue(QStringLiteral("diff-commit"), [hash](LibGit2Backend& backend) {
+        TaskResult result;
+        const QString diff = backend.commitDiff(hash, &result.error);
+        result.apply = [diff, hash](GitManager& manager) {
+            emit manager.sigDiffReady(diff, hash.left(8), false, false);
+        };
+        return result;
+    });
 }
 
-void GitManager::stageFile(const QString& path) { run(QStringLiteral("stage"), {"add", "--", path}); }
-void GitManager::unstageFile(const QString& path) { run(QStringLiteral("unstage"), {"reset", "-q", "HEAD", "--", path}); }
-void GitManager::stageAll() { run(QStringLiteral("stage-all"), {"add", "-A"}); }
-void GitManager::unstageAll() { run(QStringLiteral("unstage-all"), {"reset", "-q"}); }
+void GitManager::stageFile(const QString& path)
+{
+    runBoolean(QStringLiteral("stage"), [path](auto& backend, auto* error) {
+        return backend.stage(path, error);
+    });
+}
+
+void GitManager::unstageFile(const QString& path)
+{
+    runBoolean(QStringLiteral("unstage"), [path](auto& backend, auto* error) {
+        return backend.unstage(path, error);
+    });
+}
+
+void GitManager::stageAll()
+{
+    runBoolean(QStringLiteral("stage-all"), [](auto& backend, auto* error) {
+        return backend.stageAll(error);
+    });
+}
+
+void GitManager::unstageAll()
+{
+    runBoolean(QStringLiteral("unstage-all"), [](auto& backend, auto* error) {
+        return backend.unstageAll(error);
+    });
+}
+
+void GitManager::discardFile(const QString& path)
+{
+    runBoolean(QStringLiteral("discard"), [path](auto& backend, auto* error) {
+        return backend.discard(path, error);
+    });
+}
+
+void GitManager::removeUntracked(const QString& path)
+{
+    runBoolean(QStringLiteral("clean"), [path](auto& backend, auto* error) {
+        return backend.removeUntracked(path, error);
+    });
+}
+
+void GitManager::applyPatch(const QString& patch, bool cached, bool reverse)
+{
+    runBoolean(QStringLiteral("apply-patch"), [patch, cached, reverse](auto& backend, auto* error) {
+        return backend.applyPatch(patch, cached, reverse, error);
+    });
+}
+
+void GitManager::commit(const QString& message, bool amend, bool signoff)
+{
+    runBoolean(QStringLiteral("commit"), [message, amend, signoff](auto& backend, auto* error) {
+        return backend.commit(message, amend, signoff, error);
+    });
+}
+
+void GitManager::checkoutBranch(const QString& name)
+{
+    runBoolean(QStringLiteral("checkout"), [name](auto& backend, auto* error) {
+        return backend.checkoutBranch(name, error);
+    });
+}
+
+void GitManager::createBranch(const QString& name, const QString& from)
+{
+    runBoolean(QStringLiteral("create-branch"), [name, from](auto& backend, auto* error) {
+        return backend.createBranch(name, from, error);
+    });
+}
+
+void GitManager::deleteBranch(const QString& name, bool force)
+{
+    runBoolean(QStringLiteral("delete-branch"), [name, force](auto& backend, auto* error) {
+        return backend.deleteBranch(name, force, error);
+    });
+}
+
+void GitManager::createTag(const QString& name, const QString& hash, const QString& message)
+{
+    runBoolean(QStringLiteral("create-tag"), [name, hash, message](auto& backend, auto* error) {
+        return backend.createTag(name, hash, message, error);
+    });
+}
+
+void GitManager::deleteTag(const QString& name)
+{
+    runBoolean(QStringLiteral("delete-tag"), [name](auto& backend, auto* error) {
+        return backend.deleteTag(name, error);
+    });
+}
+
+void GitManager::addRemote(const QString& name, const QString& url)
+{
+    runBoolean(QStringLiteral("add-remote"), [name, url](auto& backend, auto* error) {
+        return backend.addRemote(name, url, error);
+    });
+}
+
+void GitManager::removeRemote(const QString& name)
+{
+    runBoolean(QStringLiteral("remove-remote"), [name](auto& backend, auto* error) {
+        return backend.removeRemote(name, error);
+    });
+}
+
+void GitManager::fetch(bool prune)
+{
+    runBoolean(QStringLiteral("fetch"), [prune](auto& backend, auto* error) {
+        return backend.fetchAll(prune, error);
+    });
+}
+
+void GitManager::pull()
+{
+    runBoolean(QStringLiteral("pull"), [](auto& backend, auto* error) {
+        return backend.pullRebase(error);
+    }, true, true);
+}
+
+void GitManager::push()
+{
+    runBoolean(QStringLiteral("push"), [](auto& backend, auto* error) {
+        return backend.push({}, {}, false, error);
+    });
+}
+
+void GitManager::pushSetUpstream(const QString& remote, const QString& branch)
+{
+    runBoolean(QStringLiteral("push-upstream"), [remote, branch](auto& backend, auto* error) {
+        return backend.push(remote, branch, true, error);
+    });
+}
+
+void GitManager::stashPush(const QString& message, bool includeUntracked)
+{
+    runBoolean(QStringLiteral("stash-push"), [message, includeUntracked](auto& backend, auto* error) {
+        return backend.stashPush(message, includeUntracked, error);
+    });
+}
+
+void GitManager::listStashes()
+{
+    enqueue(QStringLiteral("stash-list"), [](LibGit2Backend& backend) {
+        TaskResult result;
+        const QStringList stashes = backend.stashes(&result.error);
+        result.apply = [stashes](GitManager& manager) {
+            emit manager.sigStashesReady(stashes);
+        };
+        return result;
+    });
+}
+
+size_t GitManager::stashIndex(const QString& ref)
+{
+    const auto match = QRegularExpression(QStringLiteral("\\{(\\d+)\\}")).match(ref);
+    return match.hasMatch() ? match.captured(1).toULongLong() : 0;
+}
+
+void GitManager::stashApply(const QString& ref, bool pop)
+{
+    const size_t index = stashIndex(ref);
+    runBoolean(pop ? QStringLiteral("stash-pop") : QStringLiteral("stash-apply"),
+               [index, pop](auto& backend, auto* error) {
+        return backend.stashApply(index, pop, error);
+    }, true, true);
+}
+
+void GitManager::stashDrop(const QString& ref)
+{
+    const size_t index = stashIndex(ref);
+    runBoolean(QStringLiteral("stash-drop"), [index](auto& backend, auto* error) {
+        return backend.stashDrop(index, error);
+    });
+}
+
+void GitManager::continueOperation(const QString& operation)
+{
+    runBoolean(operation + QStringLiteral("-continue"), [operation](auto& backend, auto* error) {
+        return backend.continueOperation(operation, error);
+    }, true, true);
+}
+
+void GitManager::abortOperation(const QString& operation)
+{
+    runBoolean(operation + QStringLiteral("-abort"), [operation](auto& backend, auto* error) {
+        return backend.abortOperation(operation, error);
+    }, true, true);
+}
+
+void GitManager::resolveConflict(const QString& path, bool ours)
+{
+    runBoolean(QStringLiteral("resolve"), [path, ours](auto& backend, auto* error) {
+        return backend.resolveConflict(path, ours, error);
+    });
+}
 
 bool GitManager::addToGitIgnore(const QString& path)
 {
     QFile file(QDir(_repoPath).filePath(QStringLiteral(".gitignore")));
     if (!file.open(QIODevice::Append | QIODevice::Text)) {
-        emit sigError(QStringLiteral("无法打开 .gitignore：%1").arg(file.errorString()));
+        emit sigError(file.errorString());
         return false;
     }
-    QTextStream(&file) << '\n' << path << '\n';
+    QTextStream stream(&file);
+    stream << QLatin1Char('\n') << path << QLatin1Char('\n');
     refresh();
     return true;
-}
-
-void GitManager::commit(const QString& message) { run(QStringLiteral("commit"), {"commit", "-m", message}); }
-void GitManager::checkoutBranch(const QString& name) { run(QStringLiteral("checkout"), {"checkout", name}); }
-void GitManager::createBranch(const QString& name, const QString& from)
-{
-    QStringList args = {"checkout", "-b", name};
-    if (!from.isEmpty()) args << from;
-    run(QStringLiteral("create-branch"), args);
-}
-void GitManager::deleteBranch(const QString& name, bool force)
-{ run(QStringLiteral("delete-branch"), {"branch", force ? "-D" : "-d", name}); }
-void GitManager::pull()
-{ run(QStringLiteral("pull"), {"pull", "--rebase", "--autostash"}, true); }
-void GitManager::push() { run(QStringLiteral("push"), {"push"}, true); }
-void GitManager::createTag(const QString& name, const QString& hash, const QString& message)
-{
-    QStringList args = {"tag"};
-    if (!message.isEmpty()) args << "-a";
-    args << name;
-    if (!message.isEmpty()) args << "-m" << message;
-    if (!hash.isEmpty()) args << hash;
-    run(QStringLiteral("create-tag"), args);
-}
-void GitManager::deleteTag(const QString& name)
-{ run(QStringLiteral("delete-tag"), {"tag", "-d", name}); }
-
-quint64 GitManager::run(const QString& operation, const QStringList& args, bool network, int timeout)
-{
-    const quint64 id = _runner.enqueue(operation, _repoPath, args, network, timeout);
-    _contexts.insert(id, {_generation, operation, {}});
-    return id;
-}
-
-void GitManager::handleResult(const GitResult& result)
-{
-    const RequestContext context = _contexts.take(result.requestId);
-    emit sigCommandRun(context.command, QString::fromUtf8(result.standardError).trimmed(), result.success());
-    if (context.generation != _generation || result.workingDirectory != _repoPath)
-        return;
-
-    if (result.operation == QStringLiteral("open")) {
-        _isValid = result.success() && !result.standardOutput.trimmed().isEmpty();
-        emit sigRepositoryOpened(_repoPath, _isValid, _isValid ? QString() : resultMessage(result));
-        if (_isValid) refresh();
-        return;
-    }
-    if (result.operation.startsWith(QStringLiteral("refresh-"))) {
-        handleRefreshPart(result);
-        return;
-    }
-    const bool diffWithChanges = result.operation.startsWith(QStringLiteral("diff-untracked:"))
-                                 && result.exitCode == 1;
-    if (result.operation.startsWith(QStringLiteral("diff-"))) {
-        if (result.success() || diffWithChanges) {
-            emit sigDiffReady(QString::fromUtf8(result.standardOutput), result.operation.section(':', 1));
-        } else emitResultError(result);
-        return;
-    }
-    if (!result.success()) {
-        emitResultError(result);
-        emit sigOperationFinished(result.operation, false, resultMessage(result));
-        return;
-    }
-    const QString output = QString::fromUtf8(result.standardOutput).trimmed();
-    emit sigOperationFinished(result.operation, true, output);
-    refresh();
-}
-
-void GitManager::handleRefreshPart(const GitResult& result)
-{
-    if (!result.success()) {
-        // 空仓库没有 log 是合法状态。
-        if (result.operation != QStringLiteral("refresh-log"))
-            emitResultError(result);
-    } else if (result.operation == QStringLiteral("refresh-status")) {
-        const StatusSummary status = StatusParser::parse(result.standardOutput);
-        _pendingState.headName = status.headName;
-        _pendingState.headHash = status.headHash;
-        _pendingState.upstream = status.upstream;
-        _pendingState.ahead = status.ahead;
-        _pendingState.behind = status.behind;
-        _pendingState.detached = status.detached;
-        _pendingState.unborn = status.unborn;
-        _pendingState.files = status.files;
-    } else if (result.operation == QStringLiteral("refresh-log")) {
-        _pendingState.commits = parseLog(result.standardOutput);
-    } else if (result.operation == QStringLiteral("refresh-branches")) {
-        _pendingState.branches = BranchParser::parse(result.standardOutput, _pendingState.headName);
-    }
-    if (--_pendingRefreshParts == 0)
-        emit sigStateReady(_pendingState);
-}
-
-void GitManager::emitResultError(const GitResult& result)
-{
-    emit sigError(resultMessage(result));
-}
-
-QVector<Commit> GitManager::parseLog(const QByteArray& output)
-{
-    QVector<Commit> commits;
-    const QString text = QString::fromUtf8(output);
-    const QStringList records = text.split(QString::fromLatin1(kRecordSeparator), Qt::SkipEmptyParts);
-    for (QString record : records) {
-        QStringList lines = record.split('\n');
-        while (!lines.isEmpty() && lines.first().isEmpty()) lines.removeFirst();
-        if (lines.size() < 7) continue;
-        Commit commit;
-        commit.hash = lines[0].trimmed();
-        commit.shortHash = lines[1].trimmed();
-        commit.parents = lines[2].split(' ', Qt::SkipEmptyParts);
-        commit.authorName = lines[3];
-        commit.date = QDateTime::fromString(lines[4], Qt::ISODate);
-        commit.subject = lines[5];
-        for (const QString& ref : lines[6].split(','))
-            if (!ref.trimmed().isEmpty()) commit.refs << ref.trimmed();
-        commits.append(commit);
-    }
-    assignLanes(commits);
-    return commits;
-}
-
-void GitManager::assignLanes(QVector<Commit>& commits)
-{
-    QVector<QString> lanes;
-    for (Commit& commit : commits) {
-        int lane = lanes.indexOf(commit.hash);
-        if (lane < 0) {
-            lane = lanes.indexOf(QString());
-            if (lane < 0) { lane = lanes.size(); lanes.append(QString()); }
-        }
-        commit.lane = lane;
-        if (commit.parents.isEmpty()) lanes[lane].clear();
-        else lanes[lane] = lanes.contains(commit.parents.first()) ? QString() : commit.parents.first();
-        for (int p = 1; p < commit.parents.size(); ++p) {
-            if (lanes.contains(commit.parents[p])) continue;
-            int freeLane = lanes.indexOf(QString());
-            if (freeLane < 0) lanes.append(commit.parents[p]);
-            else lanes[freeLane] = commit.parents[p];
-        }
-        commit.activeLanes = lanes;
-        while (!commit.activeLanes.isEmpty() && commit.activeLanes.last().isEmpty())
-            commit.activeLanes.removeLast();
-    }
 }
 
 } // namespace Git

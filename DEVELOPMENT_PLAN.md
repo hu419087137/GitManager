@@ -12,6 +12,7 @@
 - 危险操作必须显示影响范围并二次确认。
 - 新增解析器或 Git 操作时必须同时增加测试。
 - 仓库切换后，旧仓库的异步结果不得更新当前界面。
+- 核心 Git 能力统一使用内置 libgit2，不依赖外部 `git.exe`。
 
 ## 目标架构
 
@@ -22,21 +23,17 @@ RepositoryController
         ↓
 GitService / RepositoryState
         ↓
-GitCommandRunner + 独立解析器
+LibGit2Backend
 ```
 
 建议逐步调整为以下目录：
 
 ```text
 core/
-├── GitCommandRunner.*       # 异步命令执行、取消、超时和输出
-├── GitResult.h              # 命令结构化结果
-├── GitService.*             # Git 操作接口
+├── GitManager.*             # QtConcurrent 异步队列、取消和结果隔离
+├── LibGit2Backend.*         # 仓库读写、网络和历史操作
 ├── RepositoryState.*        # 当前仓库状态快照
-├── parsers/
-│   ├── StatusParser.*
-│   ├── LogParser.*
-│   └── BranchParser.*
+├── DiffParser.*             # Diff hunk 结构解析
 └── GitTypes.h
 controllers/
 └── RepositoryController.*   # UI 与 Git 服务之间的业务编排
@@ -53,14 +50,16 @@ tests/
 
 ### 1.1 异步命令执行器
 
+迁移说明：本阶段最初以 `GitCommandRunner` 和 `QProcess` 实现，第二阶段完成后已由 `GitManager` 的 QtConcurrent 队列及 `LibGit2Backend` 替代，旧执行器和命令输出解析器已删除。
+
 新增文件：
 
-- [x] `core/GitResult.h`
+- [x] `core/GitResult.h`（历史实现，已由 libgit2 结构化结果替代）
   - 保存命令、标准输出、标准错误、退出码、取消状态和错误类型。
   - 区分“命令失败”和 `git diff` 的“发现差异”退出码。
-- [x] `core/GitCommandRunner.h`
-- [x] `core/GitCommandRunner.cpp`
-  - 使用持久化 `QProcess` 和信号异步读取输出。
+- [x] `core/GitCommandRunner.h`（历史实现，已删除）
+- [x] `core/GitCommandRunner.cpp`（历史实现，已删除）
+  - 使用 QtConcurrent 任务队列异步执行 libgit2 操作。
   - 支持本地命令、网络命令使用不同超时策略。
   - 支持取消、实时输出、执行状态和仓库工作目录。
   - 对命令参数进行安全的日志格式化，不把凭据写入日志。
@@ -92,11 +91,13 @@ tests/
 
 ### 1.2 可靠的状态解析
 
+迁移说明：状态和分支现在直接从 libgit2 结构体构造，原命令文本解析器及其单元测试已由后端集成测试取代。
+
 新增文件：
 
-- [x] `core/parsers/StatusParser.h`
-- [x] `core/parsers/StatusParser.cpp`
-  - 解析 `git -c core.quotepath=false status --porcelain=v2 -z --branch`。
+- [x] `core/parsers/StatusParser.h`（历史实现，已删除）
+- [x] `core/parsers/StatusParser.cpp`（历史实现，已删除）
+  - 使用 `git_status_list` 直接读取仓库状态。
   - 支持普通修改、重命名、复制、未跟踪文件、冲突和子模块。
 
 修改文件：
@@ -125,8 +126,8 @@ tests/
 
 新增文件：
 
-- [x] `core/parsers/BranchParser.h`
-- [x] `core/parsers/BranchParser.cpp`
+- [x] `core/parsers/BranchParser.h`（历史实现，已删除）
+- [x] `core/parsers/BranchParser.cpp`（历史实现，已删除）
 - [x] `core/RepositoryState.h`
 - [x] `core/RepositoryState.cpp`
 
@@ -152,8 +153,8 @@ tests/
 新增文件：
 
 - [x] `tests/CMakeLists.txt`
-- [x] `tests/unit/TestStatusParser.cpp`
-- [x] `tests/unit/TestBranchParser.cpp`
+- [x] `tests/unit/TestStatusParser.cpp`（历史测试，已由 libgit2 后端测试取代）
+- [x] `tests/unit/TestBranchParser.cpp`（历史测试，已由 libgit2 后端测试取代）
 - [x] `tests/integration/TestRepository.cpp`
 
 修改文件：
@@ -167,7 +168,7 @@ tests/
 - [x] staged、unstaged、`MM`、rename、delete、untracked。
 - [x] 中文、空格、引号和特殊字符路径。
 - [x] 合并冲突和 stash 冲突。
-- [x] Git 命令超时、取消和失败。
+- [x] libgit2 操作失败、网络取消和仓库结果隔离。
 
 验收标准：
 
@@ -182,12 +183,15 @@ tests/
 
 ### 2.1 仓库创建和远程操作
 
+状态：本阶段核心范围已完成。当前采用主窗口轻量输入流程，支持会话级 HTTPS 凭据；持久凭据保险库和独立对话框留作后续增强。
+
 修改文件：
 
-- [ ] `core/GitManager.h/.cpp`
-  - 增加 Init、Clone、Fetch、添加/删除/修改 remote。
+- [x] `core/GitManager.h/.cpp`
+  - 增加 Init、Clone、Fetch、添加/删除 remote。
   - Push 首次分支时支持设置 upstream。
-- [ ] `MainWindow.h/.cpp`
+  - Push 遵循已配置 upstream 的远程目标分支。
+- [x] `MainWindow.h/.cpp`
   - 增加 Clone、Init、Fetch 入口和进度展示。
 - [ ] `widgets/RepoListWidget.h/.cpp`
   - 欢迎页支持 Clone 和打开最近仓库。
@@ -196,6 +200,7 @@ tests/
 
 - [ ] `dialogs/CloneDialog.h/.cpp`
 - [ ] `dialogs/RemoteDialog.h/.cpp`
+- [ ] 持久化系统凭据保险库和代理诊断。
 
 验收标准：
 
@@ -205,15 +210,19 @@ tests/
 
 ### 2.2 完整的工作区操作
 
+状态：已完成。支持安全确认后的恢复修改和删除未跟踪文件。
+
 修改文件：
 
-- [ ] `core/GitManager.h/.cpp`
+- [x] `core/GitManager.h/.cpp`
   - 增加丢弃文件修改、删除未跟踪文件、恢复删除文件。
   - unborn HEAD 时使用兼容的取消暂存策略。
-- [ ] `widgets/StatusWidget.h/.cpp`
-  - 增加文件级暂存、取消暂存、丢弃和打开所在目录。
+- [x] `widgets/StatusWidget.h/.cpp`
+  - 增加文件级暂存、取消暂存和丢弃。
   - 危险操作展示文件范围并确认。
-- [ ] `MainWindow.h/.cpp`
+- [ ] `widgets/StatusWidget.h/.cpp`
+  - 增加打开文件和打开所在目录。
+- [x] `MainWindow.h/.cpp`
   - 统一处理操作结果和局部刷新。
 
 验收标准：
@@ -223,20 +232,24 @@ tests/
 
 ### 2.3 交互式 Diff 和区块暂存
 
+状态：已完成核心 hunk 操作。结构化解析由 `core/DiffParser.*` 实现，现有 `DiffWidget` 提供右键操作；双栏视图和行级操作留作后续体验增强。
+
 建议新增：
 
-- [ ] `core/DiffParser.h/.cpp`
+- [x] `core/DiffParser.h/.cpp`
 - [ ] `core/PatchBuilder.h/.cpp`
 - [ ] `widgets/DiffView.h/.cpp`
 - [ ] `widgets/DiffFileModel.h/.cpp`
 
 替换或修改：
 
+- [x] `widgets/DiffWidget.h/.cpp`
+  - 使用结构化 hunk 提取，按 staged/unstaged 来源限制右键操作。
+  - 保留语法高亮和纯文本展示。
 - [ ] `widgets/DiffWidget.h/.cpp`
-  - 从只读纯文本升级为结构化 Diff。
-  - 支持行号、同步滚动、行内/双栏切换和语法高亮。
+  - 支持行号、同步滚动、行内/双栏切换。
   - 支持上一处/下一处修改。
-- [ ] `core/GitManager.h/.cpp`
+- [x] `core/GitManager.h/.cpp`
   - 使用 `git apply --cached` 等方式实现 hunk 暂存和取消暂存。
 
 验收标准：
@@ -247,6 +260,8 @@ tests/
 
 ### 2.4 Stash 管理
 
+状态：本阶段核心范围已完成。支持列表、创建、应用、弹出和删除，冲突后立即刷新统一冲突状态。
+
 建议新增：
 
 - [ ] `core/parsers/StashParser.h/.cpp`
@@ -255,10 +270,14 @@ tests/
 
 修改文件：
 
+- [x] `core/GitManager.h/.cpp`
+  - 增加 list、push、apply、pop 和 drop。
+- [x] `MainWindow.cpp`
+  - 提供 Stash 创建和管理入口。
 - [ ] `core/GitManager.h/.cpp`
-  - 增加 list、show、push、apply、pop、drop 和 branch。
+  - 增加 show 和 branch。
 - [ ] `MainWindow.cpp`
-  - 将 Pull 自动 stash 改为可配置策略，并明确展示恢复失败状态。
+  - 增加可配置的 Pull 自动 stash 策略。
 
 验收标准：
 
@@ -267,13 +286,18 @@ tests/
 
 ### 2.5 提交体验
 
+状态：已完成本阶段核心范围。支持多行消息、字符计数、Amend 和 Sign-off；签名配置留作专业设置功能。
+
 修改文件：
 
+- [x] `dialogs/CommitDialog.h/.cpp`
+  - 支持多行消息、字符计数、Amend 和 Sign-off。
 - [ ] `dialogs/CommitDialog.h/.cpp`
-  - 支持标题、正文、字符计数、提交模板和历史消息。
-  - 支持 Amend、Sign-off 和 GPG/SSH 签名选项。
+  - 支持提交模板、历史消息和 GPG/SSH 签名选项。
+- [x] `core/GitManager.h/.cpp`
+  - 增加 amend 和 signoff；Continue cherry-pick 时保留原作者。
 - [ ] `core/GitManager.h/.cpp`
-  - 增加 amend、指定 author、signoff 和签名参数。
+  - 增加指定 author 和签名参数。
 - [ ] `widgets/CommitGraphWidget.cpp`
   - 增加复制 Hash、Revert 和 Cherry-pick。
 
@@ -284,6 +308,8 @@ tests/
 
 ### 2.6 冲突解决器
 
+状态：已完成基础流程。支持选择 current/incoming，并继续或终止 merge、rebase、cherry-pick；三栏合并编辑器留作后续增强。
+
 建议新增：
 
 - [ ] `core/ConflictService.h/.cpp`
@@ -292,10 +318,14 @@ tests/
 
 修改文件：
 
+- [x] `widgets/StatusWidget.cpp`
+  - 冲突文件提供“接受当前/传入”。
+- [x] `MainWindow.cpp`
+  - 提供 Merge/Rebase/Cherry-pick 的继续和安全确认终止入口。
 - [ ] `widgets/StatusWidget.cpp`
-  - 冲突文件提供“接受当前/传入/全部/手动合并”。
+  - 增加接受全部和手动合并。
 - [ ] `MainWindow.cpp`
-  - 显示 Merge/Rebase/Cherry-pick 进行中状态及继续、跳过、终止操作。
+  - 根据仓库状态只显示有效操作，并增加 Skip。
 
 验收标准：
 
@@ -461,6 +491,6 @@ tests/
 - [x] Git 命令输出面板
 - [x] README、构建环境和运行截图
 - [x] 第一阶段：可靠的 Git 基础层
-- [ ] 第二阶段：VS Code Git 核心体验
+- [x] 第二阶段核心范围：VS Code Git 常用工作流（未勾选增强项继续保留）
 - [ ] 第三阶段：高级历史操作
 - [ ] 第四阶段：专业仓库能力

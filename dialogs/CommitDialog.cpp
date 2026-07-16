@@ -5,6 +5,7 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QDialogButtonBox>
+#include <QCheckBox>
 
 CommitDialog::CommitDialog(const QStringList& stagedFiles, QWidget* parent)
     : QDialog(parent)
@@ -25,6 +26,9 @@ CommitDialog::CommitDialog(const QStringList& stagedFiles, QWidget* parent)
 
     _messageEdit = new QTextEdit(this);
     _messageEdit->setPlaceholderText(QStringLiteral("Commit message (required)"));
+    _countLabel = new QLabel(QStringLiteral("0 characters"), this);
+    _amendCheck = new QCheckBox(QStringLiteral("Amend previous commit"), this);
+    _signoffCheck = new QCheckBox(QStringLiteral("Add Signed-off-by"), this);
 
     auto* buttonBox = new QDialogButtonBox(this);
     _commitBtn = buttonBox->addButton(QStringLiteral("Commit"),
@@ -38,6 +42,12 @@ CommitDialog::CommitDialog(const QStringList& stagedFiles, QWidget* parent)
     layout->addSpacing(8);
     layout->addWidget(new QLabel(QStringLiteral("Commit message:"), this));
     layout->addWidget(_messageEdit, 1);
+    auto* options = new QHBoxLayout;
+    options->addWidget(_amendCheck);
+    options->addWidget(_signoffCheck);
+    options->addStretch();
+    options->addWidget(_countLabel);
+    layout->addLayout(options);
     layout->addWidget(buttonBox);
 
     connect(_messageEdit, &QTextEdit::textChanged,
@@ -45,6 +55,9 @@ CommitDialog::CommitDialog(const QStringList& stagedFiles, QWidget* parent)
     connect(buttonBox, &QDialogButtonBox::accepted, this, &QDialog::accept);
     connect(buttonBox, &QDialogButtonBox::rejected, this, &QDialog::reject);
 }
+
+bool CommitDialog::amend() const { return _amendCheck->isChecked(); }
+bool CommitDialog::signoff() const { return _signoffCheck->isChecked(); }
 
 QString CommitDialog::commitMessage() const
 {
@@ -54,4 +67,5 @@ QString CommitDialog::commitMessage() const
 void CommitDialog::slotTextChanged()
 {
     _commitBtn->setEnabled(!_messageEdit->toPlainText().trimmed().isEmpty());
+    _countLabel->setText(QStringLiteral("%1 characters").arg(_messageEdit->toPlainText().size()));
 }

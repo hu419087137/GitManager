@@ -12,6 +12,7 @@ constexpr int kRolePath = Qt::UserRole;
 constexpr int kRoleStaged = Qt::UserRole + 1;
 constexpr int kRoleUntracked = Qt::UserRole + 2;
 constexpr int kRoleHeader = Qt::UserRole + 3;
+constexpr int kRoleConflict = Qt::UserRole + 4;
 
 QListWidgetItem* addHeader(QListWidget* list, const QString& title, int count)
 {
@@ -77,6 +78,7 @@ void StatusWidget::setFiles(const QVector<Git::File>& files)
             item->setData(kRolePath, file.path);
             item->setData(kRoleStaged, isStaged);
             item->setData(kRoleUntracked, untracked);
+            item->setData(kRoleConflict, file.conflicted);
             item->setToolTip(QStringLiteral("Index: %1  Worktree: %2\n%3")
                 .arg(file.statusText()[0]).arg(file.statusText()[1]).arg(file.path));
         }
@@ -117,6 +119,15 @@ void StatusWidget::slotContextMenu(const QPoint& pos)
     if (item->data(kRoleUntracked).toBool()) {
         menu.addSeparator();
         menu.addAction(QStringLiteral("Add to .gitignore"), [this, path] { emit sigIgnoreRequested(path); });
+    }
+    menu.addSeparator();
+    const bool untracked = item->data(kRoleUntracked).toBool();
+    menu.addAction(untracked ? QStringLiteral("Delete Untracked File") : QStringLiteral("Discard Changes"),
+                   [this, path, untracked] { emit sigDiscardRequested(path, untracked); });
+    if (item->data(kRoleConflict).toBool()) {
+        menu.addSeparator();
+        menu.addAction(QStringLiteral("Accept Current"), [this, path] { emit sigResolveRequested(path, true); });
+        menu.addAction(QStringLiteral("Accept Incoming"), [this, path] { emit sigResolveRequested(path, false); });
     }
     menu.exec(_list->mapToGlobal(pos));
 }

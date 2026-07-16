@@ -1,34 +1,96 @@
 #ifndef LIBGIT2BACKEND_H
 #define LIBGIT2BACKEND_H
 
-#include "GitTypes.h"
-#include <QString>
+#include "RepositoryState.h"
+#include <QStringList>
+#include <atomic>
+#include <functional>
 #include <git2/types.h>
 
 namespace Git {
 
+struct RemoteCredentials {
+    QString username;
+    QString secret;
+};
+
 class LibGit2Backend {
 public:
+    using ProgressCallback = std::function<void(const QString&, int)>;
+
     LibGit2Backend();
     ~LibGit2Backend();
     LibGit2Backend(const LibGit2Backend&) = delete;
     LibGit2Backend& operator=(const LibGit2Backend&) = delete;
 
+    void setCredentials(const RemoteCredentials& credentials);
+    void setProgressCallback(ProgressCallback callback);
+    void setCancelFlag(const std::atomic_bool* cancelFlag);
+
     bool open(const QString& path, QString* error = nullptr);
+    bool initialize(const QString& path, QString* error = nullptr);
+    bool clone(const QString& url, const QString& path, QString* error = nullptr);
     void close();
     bool isOpen() const { return _repository != nullptr; }
     QString rootPath() const;
-    StatusSummary status(QString* error = nullptr) const;
+
+    RepositoryState snapshot(QString* error = nullptr) const;
+    QString fileDiff(const QString& path, bool staged, bool untracked,
+                     QString* error = nullptr) const;
+    QString commitDiff(const QString& hash, QString* error = nullptr) const;
+
     bool stage(const QString& path, QString* error = nullptr);
     bool unstage(const QString& path, QString* error = nullptr);
     bool stageAll(QString* error = nullptr);
+    bool unstageAll(QString* error = nullptr);
     bool discard(const QString& path, QString* error = nullptr);
+    bool removeUntracked(const QString& path, QString* error = nullptr);
+    bool applyPatch(const QString& patch, bool cached, bool reverse,
+                    QString* error = nullptr);
+
+    bool commit(const QString& message, bool amend, bool signoff,
+                QString* error = nullptr);
+    bool checkoutBranch(const QString& name, QString* error = nullptr);
+    bool createBranch(const QString& name, const QString& from,
+                      QString* error = nullptr);
+    bool deleteBranch(const QString& name, bool force, QString* error = nullptr);
+    bool createTag(const QString& name, const QString& target,
+                   const QString& message, QString* error = nullptr);
+    bool deleteTag(const QString& name, QString* error = nullptr);
+
+    bool addRemote(const QString& name, const QString& url, QString* error = nullptr);
+    bool removeRemote(const QString& name, QString* error = nullptr);
+    bool fetchAll(bool prune, QString* error = nullptr);
+    bool push(const QString& remote, const QString& branch, bool setUpstream,
+              QString* error = nullptr);
+    bool pullRebase(QString* error = nullptr);
+
+    QStringList stashes(QString* error = nullptr) const;
+    bool stashPush(const QString& message, bool includeUntracked,
+                   QString* error = nullptr);
+    bool stashApply(size_t index, bool pop, QString* error = nullptr);
+    bool stashDrop(size_t index, QString* error = nullptr);
+
+    bool resolveConflict(const QString& path, bool ours, QString* error = nullptr);
+    bool continueOperation(const QString& operation, QString* error = nullptr);
+    bool abortOperation(const QString& operation, QString* error = nullptr);
 
     static QString lastError(const QString& fallback);
+    static QString reversePatch(const QString& patch);
 
 private:
+    bool fetchRemote(const QString& name, bool prune, QString* error);
+    bool finishRebase(git_rebase* rebase, QString* error);
+    bool createStateCommit(const QString& operation, QString* error);
+    bool isCancelled() const;
+    void progress(const QString& text, int percent = -1) const;
+    static void assignLanes(QVector<Commit>& commits);
+
     git_repository* _repository {nullptr};
+    RemoteCredentials _credentials;
+    ProgressCallback _progressCallback;
+    const std::atomic_bool* _cancelFlag {nullptr};
 };
 
 } // namespace Git
-#endif
+#endif // LIBGIT2BACKEND_H
