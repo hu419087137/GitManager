@@ -85,6 +85,10 @@ cmake --build build --config Release
 
 Pull 操作会在工作区不干净时自动创建临时 stash，执行 `pull --rebase` 后再恢复改动。如果恢复时发生冲突，需要在仓库中手动解决。
 
+## 开发计划
+
+后续架构调整、功能路线、逐文件任务和验收标准请参阅 [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md)。实施完成后可直接在计划文件中勾选对应任务。
+
 ## 项目结构
 
 ```text
