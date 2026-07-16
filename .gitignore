@@ -5,6 +5,7 @@
 
 # CMake 与编译产物
 build/
+build-*/
 cmake-build-*/
 CMakeFiles/
 CMakeCache.txt
