@@ -340,19 +340,22 @@ tests/
 
 ### 3.1 提交图性能与查询
 
+状态：已完成。提交历史已从仓库状态快照中拆分，默认每页加载 200 条；引用发生变化时会自动放弃旧分页并重新加载，普通工作区状态刷新不会重置提交图。
+
 修改文件：
 
-- [ ] `core/GitManager.cpp`
+- [x] `core/GitManager.cpp`
   - 日志改为分页或增量加载，不再固定一次读取 1000 条。
-- [ ] `widgets/CommitGraphWidget.h/.cpp`
+- [x] `widgets/CommitGraphWidget.h/.cpp`
   - 增加搜索、作者/日期/分支/路径过滤。
   - 支持继续加载历史、复制 Hash、查看父子提交。
   - 保存列宽、排序和图形显示设置。
 
-建议新增：
+实现说明：
 
-- [ ] `core/parsers/LogParser.h/.cpp`
-- [ ] `widgets/CommitDetailsWidget.h/.cpp`
+- 历史查询直接使用 libgit2 结构化对象，不新增命令日志解析器。
+- 提交详情继续复用现有 Diff 面板，不额外增加重复的详情组件。
+- 测试覆盖超过 1000 条提交的分页、过滤、引用变化、空仓库、快速查询切换和仓库切换隔离。
 
 ### 3.2 历史修改操作
 

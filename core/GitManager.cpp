@@ -23,6 +23,9 @@ GitManager::GitManager(QObject* parent)
     : QObject(parent)
 {
     qRegisterMetaType<RepositoryState>();
+    qRegisterMetaType<Commit>();
+    qRegisterMetaType<CommitHistoryQuery>();
+    qRegisterMetaType<CommitHistoryPage>();
 }
 
 GitManager::~GitManager()
@@ -73,6 +76,7 @@ void GitManager::startNext()
     _busy = true;
     const Task task = _tasks.dequeue();
     _activeCancelFlag = task.cancelFlag;
+    _activeOperation = task.operation;
     emit sigBusyChanged(true);
     emit sigCommandStarted(operationLabel(task.operation));
 
@@ -90,6 +94,7 @@ void GitManager::startNext()
 
         _busy = false;
         _activeCancelFlag.reset();
+        _activeOperation.clear();
 
         if (current && !cancelled) {
             if (result.apply && (result.error.isEmpty() || result.applyOnError))
@@ -106,7 +111,8 @@ void GitManager::startNext()
                 if (task.refreshAfter)
                     refresh();
             }
-        } else if (cancelled && sameRepository && _isValid) {
+        } else if (cancelled && sameRepository && _isValid
+                   && task.reportCompletion) {
             emit sigOperationFinished(task.operation, false,
                                       QStringLiteral("操作已取消"));
             refresh();
@@ -163,7 +169,7 @@ void GitManager::runBoolean(const QString& operation,
             const RepositoryState state = backend.snapshot(nullptr);
             result.applyOnError = true;
             result.apply = [state](GitManager& manager) {
-                emit manager.sigStateReady(state);
+                manager.publishState(state);
             };
         }
         return result;
@@ -244,7 +250,7 @@ void GitManager::refresh()
         TaskResult result;
         const RepositoryState state = backend.snapshot(&result.error);
         result.apply = [state](GitManager& manager) {
-            emit manager.sigStateReady(state);
+            manager.publishState(state);
         };
         return result;
     });
@@ -256,14 +262,177 @@ void GitManager::cancelAll()
         _activeCancelFlag->store(true);
     _tasks.clear();
     ++_generation;
+    resetCommitHistoryState();
+    ++_diffRequest;
+}
+
+void GitManager::setCommitHistoryQuery(const CommitHistoryQuery& query)
+{
+    CommitHistoryQuery normalized = query;
+    normalized.searchText = normalized.searchText.trimmed();
+    normalized.author = normalized.author.trimmed();
+    normalized.path = normalized.path.trimmed();
+    normalized.offset = 0;
+    normalized.limit = 200;
+    normalized.expectedRefsVersion.clear();
+    if (_historyQuery.sameFilter(normalized)
+        && (_historyLoaded || _historyLoading))
+        return;
+    _historyQuery = normalized;
+    reloadCommitHistory();
+}
+
+void GitManager::reloadCommitHistory()
+{
+    discardQueuedHistoryTasks();
+    ++_historyRequest;
+    _historyRefsVersion.clear();
+    _historyLoadedCount = 0;
+    _historyHasMore = true;
+    _historyLoaded = false;
+    if (!_isValid) {
+        if (_historyLoading) {
+            _historyLoading = false;
+            emit sigCommitHistoryLoading(false);
+        }
+        return;
+    }
+    requestCommitHistory(false);
+}
+
+void GitManager::loadMoreCommits()
+{
+    if (!_isValid || _historyLoading || !_historyHasMore)
+        return;
+    requestCommitHistory(true);
+}
+
+void GitManager::publishState(const RepositoryState& state)
+{
+    const bool historyChanged = !_historyLoaded
+        || state.refsVersion != _historyRefsVersion;
+    const quint64 requestBeforeStateSignal = _historyRequest;
+    emit sigStateReady(state);
+    if (_isValid && historyChanged
+        && requestBeforeStateSignal == _historyRequest) {
+        reloadCommitHistory();
+    }
+}
+
+void GitManager::requestCommitHistory(bool append)
+{
+    if (!_isValid || (append && (_historyLoading || !_historyHasMore)))
+        return;
+
+    CommitHistoryQuery request = _historyQuery;
+    request.offset = append ? _historyLoadedCount : 0;
+    request.limit = 200;
+    request.expectedRefsVersion = append ? _historyRefsVersion : QString();
+    const quint64 requestId = ++_historyRequest;
+    const QString repositoryPath = _repoPath;
+    _historyLoading = true;
+    emit sigCommitHistoryLoading(true);
+
+    enqueue(QStringLiteral("history"),
+            [request, requestId, repositoryPath](LibGit2Backend& backend) {
+        TaskResult result;
+        CommitHistoryPage page;
+        if (backend.open(repositoryPath, &result.error))
+            page = backend.commitHistory(request, &result.error);
+        const QString error = result.error;
+        const bool success = error.isEmpty();
+        result.applyOnError = true;
+        result.apply = [page, error, success, requestId](GitManager& manager) {
+            if (requestId != manager._historyRequest)
+                return;
+            manager._historyLoading = false;
+            emit manager.sigCommitHistoryLoading(false);
+            if (!success) {
+                emit manager.sigError(error);
+                return;
+            }
+
+            if (page.offset == 0 || page.resetRequired) {
+                manager._historyLoadedCount = page.commits.size();
+            } else if (page.offset == manager._historyLoadedCount) {
+                manager._historyLoadedCount += page.commits.size();
+            } else {
+                manager.reloadCommitHistory();
+                return;
+            }
+            manager._historyRefsVersion = page.refsVersion;
+            manager._historyHasMore = page.hasMore;
+            manager._historyLoaded = true;
+            emit manager.sigCommitHistoryReady(page);
+        };
+        return result;
+    }, false, false, false, false);
+}
+
+void GitManager::discardQueuedHistoryTasks()
+{
+    if (_activeOperation == QLatin1String("history") && _activeCancelFlag)
+        _activeCancelFlag->store(true);
+
+    QQueue<Task> remaining;
+    while (!_tasks.isEmpty()) {
+        Task task = _tasks.dequeue();
+        if (task.operation == QLatin1String("history")) {
+            task.cancelFlag->store(true);
+            continue;
+        }
+        remaining.enqueue(std::move(task));
+    }
+    _tasks = std::move(remaining);
+}
+
+void GitManager::resetCommitHistoryState()
+{
+    ++_historyRequest;
+    _historyRefsVersion.clear();
+    _historyLoadedCount = 0;
+    _historyHasMore = true;
+    _historyLoaded = false;
+    if (_historyLoading) {
+        _historyLoading = false;
+        emit sigCommitHistoryLoading(false);
+    }
+}
+
+void GitManager::cancelDiffRequest()
+{
+    ++_diffRequest;
+    discardQueuedDiffTasks();
+}
+
+void GitManager::discardQueuedDiffTasks()
+{
+    if (_activeOperation.startsWith(QLatin1String("diff-")) && _activeCancelFlag)
+        _activeCancelFlag->store(true);
+
+    QQueue<Task> remaining;
+    while (!_tasks.isEmpty()) {
+        Task task = _tasks.dequeue();
+        if (task.operation.startsWith(QLatin1String("diff-"))) {
+            task.cancelFlag->store(true);
+            continue;
+        }
+        remaining.enqueue(std::move(task));
+    }
+    _tasks = std::move(remaining);
 }
 
 void GitManager::fetchFileDiff(const QString& path, bool staged, bool untracked)
 {
-    enqueue(QStringLiteral("diff-file"), [path, staged, untracked](LibGit2Backend& backend) {
+    cancelDiffRequest();
+    const quint64 requestId = _diffRequest;
+    enqueue(QStringLiteral("diff-file"),
+            [path, staged, untracked, requestId](LibGit2Backend& backend) {
         TaskResult result;
         const QString diff = backend.fileDiff(path, staged, untracked, &result.error);
-        result.apply = [diff, path, staged](GitManager& manager) {
+        result.apply = [diff, path, staged, requestId](GitManager& manager) {
+            if (requestId != manager._diffRequest)
+                return;
             emit manager.sigDiffReady(diff, path, staged, true);
         };
         return result;
@@ -272,10 +441,14 @@ void GitManager::fetchFileDiff(const QString& path, bool staged, bool untracked)
 
 void GitManager::fetchCommitDiff(const QString& hash)
 {
-    enqueue(QStringLiteral("diff-commit"), [hash](LibGit2Backend& backend) {
+    cancelDiffRequest();
+    const quint64 requestId = _diffRequest;
+    enqueue(QStringLiteral("diff-commit"), [hash, requestId](LibGit2Backend& backend) {
         TaskResult result;
         const QString diff = backend.commitDiff(hash, &result.error);
-        result.apply = [diff, hash](GitManager& manager) {
+        result.apply = [diff, hash, requestId](GitManager& manager) {
+            if (requestId != manager._diffRequest)
+                return;
             emit manager.sigDiffReady(diff, hash.left(8), false, false);
         };
         return result;

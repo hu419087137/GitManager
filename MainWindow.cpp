@@ -148,9 +148,22 @@ void MainWindow::connectSignals()
             this, &MainWindow::slotRepositoryOpened);
     connect(_git, &Git::GitManager::sigStateReady,
             this, &MainWindow::slotStateReady);
+    connect(_git, &Git::GitManager::sigCommitHistoryReady, this,
+            [this](const Git::CommitHistoryPage& page) {
+        if (page.offset == 0 || page.resetRequired)
+            _commitGraph->resetHistory(page);
+        else
+            _commitGraph->appendHistory(page);
+    });
+    connect(_git, &Git::GitManager::sigCommitHistoryLoading,
+            _commitGraph, &CommitGraphWidget::setHistoryLoading);
     connect(_git, &Git::GitManager::sigDiffReady, this,
             [this](const QString& diff, const QString&, bool staged,
                    bool hunkActionsEnabled) {
+        const DiffSource source = hunkActionsEnabled
+            ? DiffSource::File : DiffSource::Commit;
+        _requestedDiffSource = source;
+        _displayedDiffSource = source;
         const int actions = !hunkActionsEnabled ? DiffWidget::NoAction
             : staged ? DiffWidget::UnstageAction
                      : DiffWidget::StageAction | DiffWidget::DiscardAction;
@@ -190,6 +203,26 @@ void MainWindow::connectSignals()
 
     connect(_commitGraph, &CommitGraphWidget::sigCommitSelected,
             this, &MainWindow::slotCommitSelected);
+    connect(_commitGraph, &CommitGraphWidget::sigCommitDetailsRequested, this,
+            [this](const QString& hash) {
+        _requestedDiffSource = DiffSource::Commit;
+        _git->fetchCommitDiff(hash);
+    });
+    connect(_commitGraph, &CommitGraphWidget::sigCommitSelectionCleared, this,
+            [this] {
+        if (_requestedDiffSource == DiffSource::Commit) {
+            _git->cancelDiffRequest();
+            _requestedDiffSource = DiffSource::None;
+        }
+        if (_displayedDiffSource == DiffSource::Commit) {
+            _diffWidget->clearDiff();
+            _displayedDiffSource = DiffSource::None;
+        }
+    });
+    connect(_commitGraph, &CommitGraphWidget::sigHistoryQueryChanged,
+            _git, &Git::GitManager::setCommitHistoryQuery);
+    connect(_commitGraph, &CommitGraphWidget::sigLoadMoreRequested,
+            _git, &Git::GitManager::loadMoreCommits);
 
     connect(_statusWidget, &StatusWidget::sigFileSelected,
             this, &MainWindow::slotFileSelected);
@@ -219,6 +252,8 @@ void MainWindow::connectSignals()
             this, &MainWindow::slotCreateTag);
     connect(_commitGraph, &CommitGraphWidget::sigDeleteTagRequested,
             this, &MainWindow::slotDeleteTag);
+
+    _git->setCommitHistoryQuery(_commitGraph->historyQuery());
 }
 
 // ============================================================
@@ -292,7 +327,10 @@ void MainWindow::slotCommit()
 void MainWindow::slotInitRepo()
 {
     const QString path = QFileDialog::getExistingDirectory(this, QStringLiteral("Initialize Repository"), QDir::homePath());
-    if (!path.isEmpty()) _git->initRepository(path);
+    if (!path.isEmpty()) {
+        _git->initRepository(path);
+        beginRepositoryTransition(path);
+    }
 }
 
 void MainWindow::slotCloneRepo()
@@ -303,7 +341,9 @@ void MainWindow::slotCloneRepo()
     if (parent.isEmpty()) return;
     QString name = url.section('/', -1);
     name.remove(QRegularExpression(QStringLiteral("\\.git$")));
-    _git->cloneRepository(url.trimmed(), QDir(parent).filePath(name));
+    const QString destination = QDir(parent).filePath(name);
+    _git->cloneRepository(url.trimmed(), destination);
+    beginRepositoryTransition(destination);
 }
 
 void MainWindow::slotFetch() { if (_git->isValid()) _git->fetch(true); }
@@ -401,11 +441,13 @@ void MainWindow::slotRepoSelected(const QString& path)
 void MainWindow::slotCommitSelected(const Git::Commit& commit)
 {
     showStatus(QStringLiteral("Loading diff for %1…").arg(commit.shortHash));
+    _requestedDiffSource = DiffSource::Commit;
     _git->fetchCommitDiff(commit.hash);
 }
 
 void MainWindow::slotFileSelected(const QString& filePath, bool staged, bool untracked)
 {
+    _requestedDiffSource = DiffSource::File;
     _git->fetchFileDiff(filePath, staged, untracked);
 }
 
@@ -503,6 +545,26 @@ void MainWindow::openRepo(const QString& path)
 {
     showStatus(QStringLiteral("Opening repository…"));
     _git->openRepository(path);
+    beginRepositoryTransition(path);
+}
+
+void MainWindow::beginRepositoryTransition(const QString& path)
+{
+    _state = {};
+    _commitGraph->clear();
+    _commitGraph->setBranches({});
+    _commitGraph->setHistoryLoading(true);
+    _branchList->setBranches({});
+    _branchList->setEnabled(false);
+    _statusWidget->setFiles({});
+    _statusWidget->setEnabled(false);
+    _diffWidget->clearDiff();
+    _requestedDiffSource = DiffSource::None;
+    _displayedDiffSource = DiffSource::None;
+    _rightTabs->setCurrentWidget(_statusWidget);
+    _repoList->setCurrentRepo({});
+    _repoLabel->setText(QStringLiteral("  Opening: %1").arg(path));
+    setWindowTitle(QStringLiteral("Git Manager — Opening"));
 }
 
 void MainWindow::refresh()
@@ -530,6 +592,9 @@ void MainWindow::slotResolveFile(const QString& filePath, bool ours)
 void MainWindow::slotRepositoryOpened(const QString& path, bool success, const QString& error)
 {
     if (!success) {
+        _commitGraph->setHistoryLoading(false);
+        _repoLabel->setText(QStringLiteral("  No repository"));
+        setWindowTitle(QStringLiteral("Git Manager"));
         QMessageBox::warning(this, QStringLiteral("Not a Git Repository"), error);
         return;
     }
@@ -545,10 +610,15 @@ void MainWindow::slotRepositoryOpened(const QString& path, bool success, const Q
 void MainWindow::slotStateReady(const Git::RepositoryState& state)
 {
     _state = state;
-    _commitGraph->setCommits(state.commits);
+    _branchList->setEnabled(true);
+    _statusWidget->setEnabled(true);
+    _commitGraph->setBranches(state.branches);
     _branchList->setBranches(state.branches);
     _statusWidget->setFiles(state.files);
     _diffWidget->clearDiff();
+    _git->cancelDiffRequest();
+    _requestedDiffSource = DiffSource::None;
+    _displayedDiffSource = DiffSource::None;
     showStatus(QStringLiteral("Ready — %1 [%2] %3")
         .arg(state.rootPath, state.displayHead(), state.syncText()));
 }

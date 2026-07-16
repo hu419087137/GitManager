@@ -35,6 +35,8 @@ public:
     QString rootPath() const;
 
     RepositoryState snapshot(QString* error = nullptr) const;
+    CommitHistoryPage commitHistory(const CommitHistoryQuery& query,
+                                    QString* error = nullptr) const;
     QString fileDiff(const QString& path, bool staged, bool untracked,
                      QString* error = nullptr) const;
     QString commitDiff(const QString& hash, QString* error = nullptr) const;
@@ -84,8 +86,6 @@ private:
     bool createStateCommit(const QString& operation, QString* error);
     bool isCancelled() const;
     void progress(const QString& text, int percent = -1) const;
-    static void assignLanes(QVector<Commit>& commits);
-
     git_repository* _repository {nullptr};
     RemoteCredentials _credentials;
     ProgressCallback _progressCallback;

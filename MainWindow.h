@@ -77,9 +77,12 @@ private slots:
     void slotBusyChanged(bool busy);
 
 private:
+    enum class DiffSource { None, File, Commit };
+
     void setupToolBar();
     void setupCentralWidget();
     void connectSignals();
+    void beginRepositoryTransition(const QString& path);
 
     /** @brief 打开仓库并刷新所有视图 */
     void openRepo(const QString& path);
@@ -104,6 +107,8 @@ private:
     QList<QAction*>    _repositoryActions;
     Git::RepositoryState _state;
     QStringList _stashes;
+    DiffSource _requestedDiffSource {DiffSource::None};
+    DiffSource _displayedDiffSource {DiffSource::None};
 };
 
 #endif // MAINWINDOW_H

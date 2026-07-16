@@ -15,7 +15,7 @@ struct RepositoryState {
     int behind {0};
     bool detached {false};
     bool unborn {false};
-    QVector<Commit> commits;
+    QString refsVersion;
     QVector<Branch> branches;
     QVector<File> files;
 

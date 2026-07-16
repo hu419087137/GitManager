@@ -4,6 +4,7 @@
 #include <QString>
 #include <QStringList>
 #include <QDateTime>
+#include <QMetaType>
 #include <QVector>
 #include <QColor>
 
@@ -18,8 +19,9 @@ struct Commit {
     QDateTime date;
     QString subject;
     QStringList refs;  // 指向该提交的分支名/标签名
+    QStringList remoteRefs; // refs 中属于远程分支的项目
 
-    // 图形布局（由 GitManager 赋值）
+    // 图形布局（由 libgit2 历史查询赋值）
     int lane {0};
     QVector<QString> activeLanes; // 该行各 lane 指向的父提交 hash
 };
@@ -34,6 +36,46 @@ struct Branch {
     QString upstream;
     int ahead {0};
     int behind {0};
+};
+
+/** @brief 提交历史查询；branch 为空表示 HEAD，"*" 表示全部分支。 */
+struct CommitHistoryQuery {
+    QString searchText;
+    QString author;
+    QString branch;
+    QString path;
+    QDateTime fromDate;
+    QDateTime toDate;
+    bool oldestFirst {false};
+    int offset {0};
+    int limit {200};
+    QString expectedRefsVersion;
+
+    bool sameFilter(const CommitHistoryQuery& other) const
+    {
+        return searchText == other.searchText
+            && author == other.author
+            && branch == other.branch
+            && path == other.path
+            && fromDate == other.fromDate
+            && toDate == other.toDate
+            && oldestFirst == other.oldestFirst;
+    }
+
+    bool hasFilters() const
+    {
+        return !searchText.isEmpty() || !author.isEmpty() || !path.isEmpty()
+            || fromDate.isValid() || toDate.isValid();
+    }
+};
+
+/** @brief 一页提交历史，以及用于检测分页期间引用变化的版本。 */
+struct CommitHistoryPage {
+    QVector<Commit> commits;
+    int offset {0};
+    bool hasMore {false};
+    bool resetRequired {false};
+    QString refsVersion;
 };
 
 /** @brief 文件状态 */
@@ -106,5 +148,9 @@ inline QColor laneColor(int lane) {
 }
 
 } // namespace Git
+
+Q_DECLARE_METATYPE(Git::Commit)
+Q_DECLARE_METATYPE(Git::CommitHistoryQuery)
+Q_DECLARE_METATYPE(Git::CommitHistoryPage)
 
 #endif // GITTYPES_H

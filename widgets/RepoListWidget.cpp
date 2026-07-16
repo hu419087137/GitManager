@@ -183,6 +183,11 @@ void RepoListWidget::setCurrentRepo(const QString& path)
 {
     _currentPath = path;
 
+    if (path.isEmpty()) {
+        rebuild();
+        return;
+    }
+
     // 仅追加新仓库，不改变现有排列顺序
     bool found = false;
     for (const RepoEntry& e : _entries) {

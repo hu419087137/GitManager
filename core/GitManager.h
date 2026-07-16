@@ -28,6 +28,10 @@ public:
     void cloneRepository(const QString& url, const QString& path);
     void refresh();
     void cancelAll();
+    void setCommitHistoryQuery(const Git::CommitHistoryQuery& query);
+    void reloadCommitHistory();
+    void loadMoreCommits();
+    void cancelDiffRequest();
     void fetchFileDiff(const QString& filePath, bool staged, bool untracked = false);
     void fetchCommitDiff(const QString& commitHash);
     void stageFile(const QString& filePath);
@@ -62,6 +66,8 @@ public:
 signals:
     void sigRepositoryOpened(const QString& path, bool success, const QString& error);
     void sigStateReady(const Git::RepositoryState& state);
+    void sigCommitHistoryReady(const Git::CommitHistoryPage& page);
+    void sigCommitHistoryLoading(bool loading);
     void sigDiffReady(const QString& diff, const QString& title,
                       bool staged, bool hunkActionsEnabled);
     void sigStashesReady(const QStringList& stashes);
@@ -104,6 +110,11 @@ private:
                     std::function<bool(LibGit2Backend&, QString*)> work,
                     bool refreshAfter = true,
                     bool refreshOnError = false);
+    void publishState(const RepositoryState& state);
+    void requestCommitHistory(bool append);
+    void discardQueuedHistoryTasks();
+    void discardQueuedDiffTasks();
+    void resetCommitHistoryState();
     static size_t stashIndex(const QString& ref);
 
     QString _repoPath;
@@ -112,7 +123,16 @@ private:
     quint64 _generation {0};
     QQueue<Task> _tasks;
     std::shared_ptr<std::atomic_bool> _activeCancelFlag;
+    QString _activeOperation;
     RemoteCredentials _credentials;
+    CommitHistoryQuery _historyQuery;
+    QString _historyRefsVersion;
+    int _historyLoadedCount {0};
+    bool _historyHasMore {true};
+    bool _historyLoaded {false};
+    bool _historyLoading {false};
+    quint64 _historyRequest {0};
+    quint64 _diffRequest {0};
 };
 
 } // namespace Git

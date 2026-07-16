@@ -4,6 +4,7 @@
 #include <git2/sys/errors.h>
 
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDebug>
 #include <QDir>
@@ -11,6 +12,7 @@
 #include <QFileInfo>
 #include <QHash>
 #include <QRegularExpression>
+#include <algorithm>
 #include <utility>
 
 namespace Git {
@@ -52,6 +54,7 @@ using ObjectHandle = GitHandle<git_object, git_object_free>;
 using RebaseHandle = GitHandle<git_rebase, git_rebase_free>;
 using ReferenceHandle = GitHandle<git_reference, git_reference_free>;
 using RemoteHandle = GitHandle<git_remote, git_remote_free>;
+using RevwalkHandle = GitHandle<git_revwalk, git_revwalk_free>;
 using SignatureHandle = GitHandle<git_signature, git_signature_free>;
 using StatusListHandle = GitHandle<git_status_list, git_status_list_free>;
 using TreeHandle = GitHandle<git_tree, git_tree_free>;
@@ -366,6 +369,181 @@ void addRef(QHash<QString, QStringList>& refs, const git_oid* oid,
         labels.append(label);
 }
 
+struct ReferenceSnapshot {
+    QHash<QString, QStringList> labelsByCommit;
+    QHash<QString, QStringList> remoteLabelsByCommit;
+    QStringList branchRefs;
+    QString version;
+    bool valid {true};
+};
+
+ReferenceSnapshot referenceSnapshot(git_repository* repository, QString* error)
+{
+    ReferenceSnapshot result;
+    QString currentHeadRef;
+    ReferenceHandle head;
+    if (git_repository_head(head.out(), repository) == 0)
+        currentHeadRef = text(git_reference_name(head.get()));
+    else
+        git_error_clear();
+
+    QStringList signatures;
+    if (currentHeadRef.startsWith(QStringLiteral("refs/heads/")))
+        signatures.append(QStringLiteral("HEAD->%1").arg(currentHeadRef));
+    git_reference_iterator* iterator = nullptr;
+    if (git_reference_iterator_new(&iterator, repository) < 0) {
+        fail(error, QStringLiteral("Cannot enumerate repository references."));
+        result.valid = false;
+        git_error_clear();
+    } else {
+        git_reference* rawReference = nullptr;
+        int nextResult = GIT_ITEROVER;
+        while ((nextResult = git_reference_next(&rawReference, iterator)) == 0) {
+            ReferenceHandle reference(rawReference);
+            rawReference = nullptr;
+            const QString fullName = text(git_reference_name(reference.get()));
+            const bool local = fullName.startsWith(QStringLiteral("refs/heads/"));
+            const bool remote = fullName.startsWith(QStringLiteral("refs/remotes/"));
+            const bool tag = fullName.startsWith(QStringLiteral("refs/tags/"));
+            if (!local && !remote && !tag)
+                continue;
+
+            ObjectHandle commitObject;
+            if (git_reference_peel(commitObject.out(), reference.get(),
+                                   GIT_OBJECT_COMMIT) < 0) {
+                if (local || remote) {
+                    fail(error, QStringLiteral("Cannot resolve branch reference."));
+                    result.valid = false;
+                    git_error_clear();
+                    break;
+                }
+                git_error_clear();
+                continue;
+            }
+
+            const git_oid* oid = git_object_id(commitObject.get());
+            const QString hash = oidText(oid);
+            signatures.append(fullName + QLatin1Char(':') + hash);
+            if (local || remote)
+                result.branchRefs.append(fullName);
+
+            QString label;
+            if (local) {
+                const QString name = fullName.mid(11);
+                label = fullName == currentHeadRef
+                    ? QStringLiteral("HEAD -> %1").arg(name) : name;
+            } else if (remote) {
+                label = fullName.mid(13);
+            } else {
+                label = QStringLiteral("tag: %1").arg(fullName.mid(10));
+            }
+            addRef(result.labelsByCommit, oid, label);
+            if (remote)
+                addRef(result.remoteLabelsByCommit, oid, label);
+        }
+        git_reference_iterator_free(iterator);
+        if (result.valid && nextResult != GIT_ITEROVER) {
+            fail(error, QStringLiteral("Cannot enumerate repository references."));
+            result.valid = false;
+        }
+        git_error_clear();
+    }
+
+    if (!result.valid)
+        return result;
+
+    if (git_repository_head_detached(repository) == 1) {
+        ReferenceHandle detachedHead;
+        if (git_repository_head(detachedHead.out(), repository) == 0) {
+            const git_oid* oid = git_reference_target(detachedHead.get());
+            addRef(result.labelsByCommit, oid, QStringLiteral("HEAD"));
+            signatures.append(QStringLiteral("HEAD:%1").arg(oidText(oid)));
+        } else {
+            git_error_clear();
+        }
+    }
+
+    std::sort(result.branchRefs.begin(), result.branchRefs.end());
+    for (auto it = result.labelsByCommit.begin(); it != result.labelsByCommit.end(); ++it)
+        std::sort(it.value().begin(), it.value().end());
+    for (auto it = result.remoteLabelsByCommit.begin();
+         it != result.remoteLabelsByCommit.end(); ++it) {
+        std::sort(it.value().begin(), it.value().end());
+    }
+    std::sort(signatures.begin(), signatures.end());
+    result.version = QString::fromLatin1(QCryptographicHash::hash(
+        signatures.join(QLatin1Char('\n')).toUtf8(), QCryptographicHash::Sha256).toHex());
+    return result;
+}
+
+void assignLane(Commit& commit, QVector<QString>& lanes)
+{
+    int lane = lanes.indexOf(commit.hash);
+    if (lane < 0) {
+        lane = lanes.indexOf(QString());
+        if (lane < 0) {
+            lane = lanes.size();
+            lanes.append(QString());
+        }
+    }
+    commit.lane = lane;
+    for (int duplicate = lane + 1; duplicate < lanes.size(); ++duplicate) {
+        if (lanes[duplicate] == commit.hash)
+            lanes[duplicate].clear();
+    }
+    lanes[lane] = commit.parents.isEmpty() ? QString() : commit.parents.first();
+    for (int parent = 1; parent < commit.parents.size(); ++parent) {
+        if (lanes.contains(commit.parents[parent]))
+            continue;
+        int freeLane = lanes.indexOf(QString());
+        if (freeLane < 0) {
+            freeLane = lanes.size();
+            lanes.append(QString());
+        }
+        lanes[freeLane] = commit.parents[parent];
+    }
+    commit.activeLanes = lanes;
+    while (!commit.activeLanes.isEmpty() && commit.activeLanes.last().isEmpty())
+        commit.activeLanes.removeLast();
+}
+
+bool commitTouchesPath(git_repository* repository, git_commit* commit,
+                       const QString& path, bool* matches, QString* error)
+{
+    *matches = false;
+    TreeHandle tree;
+    if (git_commit_tree(tree.out(), commit) < 0)
+        return fail(error, QStringLiteral("Cannot read commit tree."));
+
+    const QByteArray pathBytes = path.toUtf8();
+    char* pathValue = const_cast<char*>(pathBytes.constData());
+    git_diff_options options = GIT_DIFF_OPTIONS_INIT;
+    options.pathspec.count = 1;
+    options.pathspec.strings = &pathValue;
+    options.flags = GIT_DIFF_INCLUDE_TYPECHANGE | GIT_DIFF_DISABLE_PATHSPEC_MATCH;
+
+    const unsigned int parentCount = git_commit_parentcount(commit);
+    const unsigned int comparisonCount = qMax(1U, parentCount);
+    for (unsigned int parentIndex = 0; parentIndex < comparisonCount; ++parentIndex) {
+        TreeHandle parentTree;
+        if (parentCount > 0) {
+            CommitHandle parent;
+            if (git_commit_parent(parent.out(), commit, parentIndex) < 0
+                || git_commit_tree(parentTree.out(), parent.get()) < 0)
+                return fail(error, QStringLiteral("Cannot read parent commit tree."));
+        }
+        DiffHandle diff;
+        if (git_diff_tree_to_tree(diff.out(), repository, parentTree.get(),
+                                  tree.get(), &options) < 0)
+            return fail(error, QStringLiteral("Cannot filter commit history by path."));
+        if (git_diff_num_deltas(diff.get()) > 0) {
+            *matches = true;
+            return true;
+        }
+    }
+    return true;
+}
+
 QString diffText(git_diff* diff, QString* error, const QString& fallback)
 {
     git_buf output = GIT_BUF_INIT;
@@ -522,9 +700,10 @@ RepositoryState LibGit2Backend::snapshot(QString* error) const
         fail(error, QStringLiteral("Cannot read repository HEAD."));
     }
 
-    QHash<QString, QStringList> refsByCommit;
-    if (result.detached && !result.headHash.isEmpty())
-        refsByCommit[result.headHash].append(QStringLiteral("HEAD"));
+    const ReferenceSnapshot refs = referenceSnapshot(_repository, error);
+    if (!refs.valid)
+        return result;
+    result.refsVersion = refs.version;
     git_branch_iterator* rawIterator = nullptr;
     if (git_branch_iterator_new(&rawIterator, _repository, GIT_BRANCH_ALL) == 0) {
         git_reference* rawBranch = nullptr;
@@ -542,10 +721,6 @@ RepositoryState LibGit2Backend::snapshot(QString* error) const
             if (git_reference_peel(commitObject.out(), branch.get(),
                                    GIT_OBJECT_COMMIT) == 0) {
                 value.hash = oidText(git_object_id(commitObject.get()));
-                addRef(refsByCommit, git_object_id(commitObject.get()),
-                       value.isCurrent
-                           ? QStringLiteral("HEAD -> %1").arg(value.name)
-                           : value.name);
             } else {
                 git_error_clear();
             }
@@ -582,67 +757,6 @@ RepositoryState LibGit2Backend::snapshot(QString* error) const
         fail(error, QStringLiteral("Cannot enumerate branches."));
         git_error_clear();
     }
-
-    git_reference_iterator* referenceIterator = nullptr;
-    if (git_reference_iterator_glob_new(&referenceIterator, _repository,
-                                        "refs/tags/*") == 0) {
-        git_reference* rawReference = nullptr;
-        while (git_reference_next(&rawReference, referenceIterator) == 0) {
-            ReferenceHandle reference(rawReference);
-            rawReference = nullptr;
-            ObjectHandle commitObject;
-            if (git_reference_peel(commitObject.out(), reference.get(),
-                                   GIT_OBJECT_COMMIT) == 0) {
-                addRef(refsByCommit, git_object_id(commitObject.get()),
-                       QStringLiteral("tag: %1")
-                           .arg(text(git_reference_shorthand(reference.get()))));
-            } else {
-                git_error_clear();
-            }
-        }
-        git_reference_iterator_free(referenceIterator);
-        git_error_clear();
-    } else {
-        git_error_clear();
-    }
-
-    if (!result.unborn && !result.headHash.isEmpty()) {
-        git_revwalk* walk = nullptr;
-        if (git_revwalk_new(&walk, _repository) == 0) {
-            git_revwalk_sorting(walk, GIT_SORT_TOPOLOGICAL | GIT_SORT_TIME);
-            int pushRc = git_revwalk_push_head(walk);
-            git_oid oid;
-            int count = 0;
-            while (pushRc == 0 && count < 1000
-                   && git_revwalk_next(&oid, walk) == 0) {
-                CommitHandle commit;
-                if (git_commit_lookup(commit.out(), _repository, &oid) < 0) {
-                    git_error_clear();
-                    continue;
-                }
-                Commit value;
-                value.hash = oidText(&oid);
-                value.shortHash = value.hash.left(8);
-                const unsigned int parentCount = git_commit_parentcount(commit.get());
-                for (unsigned int parent = 0; parent < parentCount; ++parent)
-                    value.parents.append(oidText(git_commit_parent_id(commit.get(), parent)));
-                const git_signature* author = git_commit_author(commit.get());
-                value.authorName = author ? text(author->name) : QString();
-                value.date = QDateTime::fromSecsSinceEpoch(
-                    git_commit_time(commit.get()), Qt::UTC);
-                value.subject = text(git_commit_summary(commit.get()));
-                value.refs = refsByCommit.value(value.hash);
-                result.commits.append(value);
-                ++count;
-            }
-            git_revwalk_free(walk);
-            git_error_clear();
-        } else {
-            fail(error, QStringLiteral("Cannot read commit history."));
-            git_error_clear();
-        }
-    }
-    assignLanes(result.commits);
 
     git_status_options statusOptions = GIT_STATUS_OPTIONS_INIT;
     statusOptions.show = GIT_STATUS_SHOW_INDEX_AND_WORKDIR;
@@ -698,6 +812,169 @@ RepositoryState LibGit2Backend::snapshot(QString* error) const
         file.submoduleState = submoduleState(_repository, file.path, primary);
         result.files.append(file);
     }
+    return result;
+}
+
+CommitHistoryPage LibGit2Backend::commitHistory(const CommitHistoryQuery& query,
+                                                QString* error) const
+{
+    CommitHistoryPage result;
+    if (!ensureRepository(_repository, error))
+        return result;
+
+    const ReferenceSnapshot refs = referenceSnapshot(_repository, error);
+    if (!refs.valid)
+        return result;
+    result.refsVersion = refs.version;
+    int offset = qMax(0, query.offset);
+    if (offset > 0 && !query.expectedRefsVersion.isEmpty()
+        && query.expectedRefsVersion != result.refsVersion) {
+        offset = 0;
+        result.resetRequired = true;
+    }
+    result.offset = offset;
+    const int limit = qBound(1, query.limit, 1000);
+
+    RevwalkHandle walk;
+    if (git_revwalk_new(walk.out(), _repository) < 0) {
+        fail(error, QStringLiteral("Cannot create commit history walker."));
+        return result;
+    }
+    unsigned int sorting = GIT_SORT_TOPOLOGICAL | GIT_SORT_TIME;
+    if (query.oldestFirst)
+        sorting |= GIT_SORT_REVERSE;
+    git_revwalk_sorting(walk.get(), sorting);
+
+    int pushResult = 0;
+    if (query.branch == QLatin1String("*")) {
+        bool pushed = false;
+        for (const QString& branchRef : refs.branchRefs) {
+            const QByteArray name = branchRef.toUtf8();
+            const int rc = git_revwalk_push_ref(walk.get(), name.constData());
+            if (rc == 0)
+                pushed = true;
+            else if (rc != GIT_ENOTFOUND) {
+                pushResult = rc;
+                break;
+            }
+            git_error_clear();
+        }
+        if (!pushed && pushResult == 0)
+            return result;
+    } else if (query.branch.isEmpty()) {
+        if (git_repository_head_unborn(_repository) == 1) {
+            git_error_clear();
+            return result;
+        }
+        pushResult = git_revwalk_push_head(walk.get());
+    } else {
+        const QByteArray revision = query.branch.toUtf8();
+        pushResult = git_revwalk_push_ref(walk.get(), revision.constData());
+        if (pushResult < 0) {
+            git_error_clear();
+            ObjectHandle object;
+            ObjectHandle commitObject;
+            if (git_revparse_single(object.out(), _repository,
+                                    revision.constData()) == 0
+                && git_object_peel(commitObject.out(), object.get(),
+                                   GIT_OBJECT_COMMIT) == 0) {
+                pushResult = git_revwalk_push(walk.get(),
+                                             git_object_id(commitObject.get()));
+            }
+        }
+    }
+    if ((pushResult == GIT_ENOTFOUND || pushResult == GIT_EUNBORNBRANCH)
+        && query.branch.isEmpty()) {
+        git_error_clear();
+        return result;
+    }
+    if (pushResult < 0) {
+        fail(error, QStringLiteral("Cannot resolve commit history branch."));
+        return result;
+    }
+
+    const QString search = query.searchText.trimmed();
+    const QString authorFilter = query.author.trimmed();
+    QString path = QDir::fromNativeSeparators(query.path.trimmed());
+    if (!path.isEmpty()) {
+        if (QFileInfo(path).isAbsolute())
+            path = QDir(rootPath()).relativeFilePath(path);
+        path = QDir::cleanPath(path);
+        if (path == QLatin1String("."))
+            path.clear();
+    }
+    QVector<QString> lanes;
+    int matchingIndex = 0;
+    git_oid oid;
+    int walkResult = GIT_ITEROVER;
+    while ((walkResult = git_revwalk_next(&oid, walk.get())) == 0) {
+        if (isCancelled()) {
+            if (error)
+                *error = QStringLiteral("Operation cancelled.");
+            return result;
+        }
+
+        CommitHandle commit;
+        if (git_commit_lookup(commit.out(), _repository, &oid) < 0) {
+            fail(error, QStringLiteral("Cannot read commit history entry."));
+            return result;
+        }
+
+        Commit value;
+        value.hash = oidText(&oid);
+        value.shortHash = value.hash.left(8);
+        const unsigned int parentCount = git_commit_parentcount(commit.get());
+        for (unsigned int parent = 0; parent < parentCount; ++parent)
+            value.parents.append(oidText(git_commit_parent_id(commit.get(), parent)));
+        const git_signature* author = git_commit_author(commit.get());
+        value.authorName = author ? text(author->name) : QString();
+        value.date = QDateTime::fromSecsSinceEpoch(git_commit_time(commit.get()), Qt::UTC);
+        value.subject = text(git_commit_summary(commit.get()));
+        value.refs = refs.labelsByCommit.value(value.hash);
+        value.remoteRefs = refs.remoteLabelsByCommit.value(value.hash);
+        if (!query.oldestFirst)
+            assignLane(value, lanes);
+
+        bool matches = true;
+        if (query.fromDate.isValid() && value.date < query.fromDate)
+            matches = false;
+        if (query.toDate.isValid() && value.date > query.toDate)
+            matches = false;
+        if (matches && !authorFilter.isEmpty()) {
+            const QString authorEmail = author ? text(author->email) : QString();
+            matches = value.authorName.contains(authorFilter, Qt::CaseInsensitive)
+                || authorEmail.contains(authorFilter, Qt::CaseInsensitive);
+        }
+        if (matches && !search.isEmpty()) {
+            const QString message = text(git_commit_message(commit.get()));
+            matches = value.hash.contains(search, Qt::CaseInsensitive)
+                || message.contains(search, Qt::CaseInsensitive)
+                || value.authorName.contains(search, Qt::CaseInsensitive)
+                || value.refs.join(QLatin1Char(' ')).contains(search,
+                                                           Qt::CaseInsensitive);
+        }
+        if (matches && !path.isEmpty()) {
+            if (!commitTouchesPath(_repository, commit.get(), path, &matches, error))
+                return result;
+        }
+        if (!matches)
+            continue;
+
+        if (matchingIndex++ < offset)
+            continue;
+        if (result.commits.size() < limit) {
+            result.commits.append(value);
+            continue;
+        }
+        result.hasMore = true;
+        break;
+    }
+
+    if (!result.hasMore && walkResult != GIT_ITEROVER) {
+        fail(error, QStringLiteral("Cannot walk commit history."));
+        return result;
+    }
+    git_error_clear();
     return result;
 }
 
@@ -1912,37 +2189,6 @@ QString LibGit2Backend::reversePatch(const QString& patch)
         }
     }
     return lines.join(QLatin1Char('\n'));
-}
-
-void LibGit2Backend::assignLanes(QVector<Commit>& commits)
-{
-    QVector<QString> lanes;
-    for (Commit& commit : commits) {
-        int lane = lanes.indexOf(commit.hash);
-        if (lane < 0) {
-            lane = lanes.indexOf(QString());
-            if (lane < 0) {
-                lane = lanes.size();
-                lanes.append(QString());
-            }
-        }
-        commit.lane = lane;
-        lanes[lane] = commit.parents.isEmpty() ? QString() : commit.parents.first();
-        for (int parent = 1; parent < commit.parents.size(); ++parent) {
-            if (lanes.contains(commit.parents[parent]))
-                continue;
-            int freeLane = lanes.indexOf(QString());
-            if (freeLane < 0) {
-                freeLane = lanes.size();
-                lanes.append(QString());
-            }
-            lanes[freeLane] = commit.parents[parent];
-        }
-        commit.activeLanes = lanes;
-        while (!commit.activeLanes.isEmpty()
-               && commit.activeLanes.last().isEmpty())
-            commit.activeLanes.removeLast();
-    }
 }
 
 } // namespace Git
