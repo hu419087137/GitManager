@@ -10,7 +10,7 @@ class QPushButton;
 class QLabel;
 
 /**
- * @brief 工作区文件状态面板（复选框选择模式）
+ * @brief 按冲突、工作区和暂存区分组的文件状态面板
  *
  * 用单一列表展示所有变更文件：
  *   - ☑ 勾选   → 已暂存，将被提交
@@ -30,7 +30,7 @@ public:
 
 signals:
     /** @brief 用户单击文件行，请求显示 diff */
-    void sigFileSelected(const QString& filePath, bool staged);
+    void sigFileSelected(const QString& filePath, bool staged, bool untracked);
 
     /** @brief 用户勾选文件，请求暂存 */
     void sigStageRequested(const QString& filePath);

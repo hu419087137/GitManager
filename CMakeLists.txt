@@ -14,8 +14,17 @@ set(SOURCES
     MainWindow.h
     MainWindow.cpp
     core/GitTypes.h
+    core/GitResult.h
+    core/RepositoryState.h
+    core/RepositoryState.cpp
+    core/GitCommandRunner.h
+    core/GitCommandRunner.cpp
     core/GitManager.h
     core/GitManager.cpp
+    core/parsers/StatusParser.h
+    core/parsers/StatusParser.cpp
+    core/parsers/BranchParser.h
+    core/parsers/BranchParser.cpp
     widgets/CommitGraphWidget.h
     widgets/CommitGraphWidget.cpp
     widgets/BranchListWidget.h
@@ -43,4 +52,10 @@ target_link_libraries(${PROJECT_NAME}
 
 if(WIN32)
     set_target_properties(${PROJECT_NAME} PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    find_package(Qt6 REQUIRED COMPONENTS Test)
+    add_subdirectory(tests)
 endif()

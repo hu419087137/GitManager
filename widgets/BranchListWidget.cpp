@@ -38,7 +38,10 @@ void BranchListWidget::setBranches(const QVector<Git::Branch>& branches)
     }
 
     for (const Git::Branch& b : branches) {
-        auto* item = new QTreeWidgetItem({b.name});
+        QString displayName = b.name;
+        if (!b.isRemote && !b.upstream.isEmpty())
+            displayName += QStringLiteral("  ↑%1 ↓%2").arg(b.ahead).arg(b.behind);
+        auto* item = new QTreeWidgetItem({displayName});
         item->setData(0, Qt::UserRole,     b.name);
         item->setData(0, Qt::UserRole + 1, b.isRemote);
 

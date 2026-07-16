@@ -17,7 +17,6 @@
 #include <QMessageBox>
 #include <QInputDialog>
 #include <QVBoxLayout>
-#include <QApplication>
 #include <QSettings>
 #include <QDir>
 
@@ -58,6 +57,9 @@ void MainWindow::setupToolBar()
     auto* pushAction    = tb->addAction(QStringLiteral("Push"));
     tb->addSeparator();
     auto* commitAction  = tb->addAction(QStringLiteral("Commit"));
+    _cancelAction       = tb->addAction(QStringLiteral("Cancel"));
+    _cancelAction->setEnabled(false);
+    _repositoryActions = {refreshAction, pullAction, pushAction, commitAction};
 
     _repoLabel = new QLabel(QStringLiteral("  No repository"), this);
     statusBar()->addPermanentWidget(_repoLabel);
@@ -67,6 +69,7 @@ void MainWindow::setupToolBar()
     connect(pullAction,    &QAction::triggered, this, &MainWindow::slotPull);
     connect(pushAction,    &QAction::triggered, this, &MainWindow::slotPush);
     connect(commitAction,  &QAction::triggered, this, &MainWindow::slotCommit);
+    connect(_cancelAction, &QAction::triggered, this, &MainWindow::slotCancelOperation);
 }
 
 void MainWindow::setupCentralWidget()
@@ -123,8 +126,23 @@ void MainWindow::connectSignals()
             this, &MainWindow::slotGitError);
     connect(_git, &Git::GitManager::sigInfo,
             this, &MainWindow::showStatus);
-    connect(_git, &Git::GitManager::sigCommandRun,
-            _terminalWidget, &TerminalWidget::appendCommand);
+    connect(_git, &Git::GitManager::sigCommandStarted,
+            _terminalWidget, &TerminalWidget::beginCommand);
+    connect(_git, &Git::GitManager::sigCommandOutput,
+            _terminalWidget, &TerminalWidget::appendOutput);
+    connect(_git, &Git::GitManager::sigRepositoryOpened,
+            this, &MainWindow::slotRepositoryOpened);
+    connect(_git, &Git::GitManager::sigStateReady,
+            this, &MainWindow::slotStateReady);
+    connect(_git, &Git::GitManager::sigDiffReady, this,
+            [this](const QString& diff, const QString&) {
+        _diffWidget->setDiff(diff);
+        _rightTabs->setCurrentWidget(_diffWidget);
+    });
+    connect(_git, &Git::GitManager::sigOperationFinished,
+            this, &MainWindow::slotOperationFinished);
+    connect(_git, &Git::GitManager::sigBusyChanged,
+            this, &MainWindow::slotBusyChanged);
 
     connect(_repoList, &RepoListWidget::sigRepoSwitchRequested,
             this, &MainWindow::slotRepoSelected);
@@ -184,31 +202,22 @@ void MainWindow::slotPull()
 {
     if (!_git->isValid()) return;
     showStatus(QStringLiteral("Pulling..."));
-    QApplication::processEvents();
-    if (_git->pull()) {
-        showStatus(QStringLiteral("Pull successful."));
-        refresh();
-    }
+    _git->pull();
 }
 
 void MainWindow::slotPush()
 {
     if (!_git->isValid()) return;
     showStatus(QStringLiteral("Pushing..."));
-    QApplication::processEvents();
-    if (_git->push()) {
-        showStatus(QStringLiteral("Push successful."));
-        refresh();
-    }
+    _git->push();
 }
 
 void MainWindow::slotCommit()
 {
     if (!_git->isValid()) return;
 
-    const QVector<Git::File> files = _git->fetchStatus();
     QStringList staged;
-    for (const Git::File& f : files) {
+    for (const Git::File& f : _state.files) {
         if (f.isStaged())
             staged << f.path;
     }
@@ -228,11 +237,10 @@ void MainWindow::slotCommit()
     if (msg.isEmpty())
         return;
 
-    if (_git->commit(msg)) {
-        showStatus(QStringLiteral("Committed: %1").arg(msg.left(60)));
-        refresh();
-    }
+    _git->commit(msg);
 }
+
+void MainWindow::slotCancelOperation() { _git->cancelAll(); }
 
 // ============================================================
 // 仓库切换
@@ -250,48 +258,32 @@ void MainWindow::slotRepoSelected(const QString& path)
 void MainWindow::slotCommitSelected(const Git::Commit& commit)
 {
     showStatus(QStringLiteral("Loading diff for %1…").arg(commit.shortHash));
-    const QString diff = _git->fetchCommitDiff(commit.hash);
-    _diffWidget->setDiff(diff);
-    _rightTabs->setCurrentWidget(_diffWidget);
+    _git->fetchCommitDiff(commit.hash);
 }
 
-void MainWindow::slotFileSelected(const QString& filePath, bool staged)
+void MainWindow::slotFileSelected(const QString& filePath, bool staged, bool untracked)
 {
-    const QString diff = _git->fetchFileDiff(filePath, staged);
-    _diffWidget->setDiff(diff);
-    _rightTabs->setCurrentWidget(_diffWidget);
+    _git->fetchFileDiff(filePath, staged, untracked);
 }
 
 void MainWindow::slotStageFile(const QString& filePath)
 {
-    if (_git->stageFile(filePath)) {
-        refresh();
-        showStatus(QStringLiteral("Staged: %1").arg(filePath));
-    }
+    _git->stageFile(filePath);
 }
 
 void MainWindow::slotUnstageFile(const QString& filePath)
 {
-    if (_git->unstageFile(filePath)) {
-        refresh();
-        showStatus(QStringLiteral("Unstaged: %1").arg(filePath));
-    }
+    _git->unstageFile(filePath);
 }
 
 void MainWindow::slotStageAll()
 {
-    if (_git->stageAll()) {
-        refresh();
-        showStatus(QStringLiteral("All files staged."));
-    }
+    _git->stageAll();
 }
 
 void MainWindow::slotUnstageAll()
 {
-    if (_git->unstageAll()) {
-        refresh();
-        showStatus(QStringLiteral("All files unstaged."));
-    }
+    _git->unstageAll();
 }
 
 void MainWindow::slotIgnoreFile(const QString& filePath)
@@ -304,18 +296,12 @@ void MainWindow::slotIgnoreFile(const QString& filePath)
 
 void MainWindow::slotCheckoutBranch(const QString& branchName)
 {
-    if (_git->checkoutBranch(branchName)) {
-        refresh();
-        showStatus(QStringLiteral("Checked out: %1").arg(branchName));
-    }
+    _git->checkoutBranch(branchName);
 }
 
 void MainWindow::slotDeleteBranch(const QString& branchName, bool force)
 {
-    if (_git->deleteBranch(branchName, force)) {
-        refresh();
-        showStatus(QStringLiteral("Deleted branch: %1").arg(branchName));
-    }
+    _git->deleteBranch(branchName, force);
 }
 
 void MainWindow::slotCreateBranch(const QString& fromBranch)
@@ -328,10 +314,7 @@ void MainWindow::slotCreateBranch(const QString& fromBranch)
     if (name.trimmed().isEmpty())
         return;
 
-    if (_git->createBranch(name.trimmed(), fromBranch)) {
-        refresh();
-        showStatus(QStringLiteral("Created and checked out: %1").arg(name.trimmed()));
-    }
+    _git->createBranch(name.trimmed(), fromBranch);
 }
 
 void MainWindow::slotCreateTag(const QString& commitHash)
@@ -351,10 +334,7 @@ void MainWindow::slotCreateTag(const QString& commitHash)
         QStringLiteral("Tag Message"),
         QStringLiteral("Annotation message (leave empty for lightweight tag):"));
 
-    if (_git->createTag(name.trimmed(), commitHash, msg.trimmed())) {
-        refresh();
-        showStatus(QStringLiteral("Created tag: %1").arg(name.trimmed()));
-    }
+    _git->createTag(name.trimmed(), commitHash, msg.trimmed());
 }
 
 void MainWindow::slotDeleteTag(const QString& tagName)
@@ -369,10 +349,7 @@ void MainWindow::slotDeleteTag(const QString& tagName)
     if (btn != QMessageBox::Yes)
         return;
 
-    if (_git->deleteTag(tagName)) {
-        refresh();
-        showStatus(QStringLiteral("Deleted tag: %1").arg(tagName));
-    }
+    _git->deleteTag(tagName);
 }
 
 // ============================================================
@@ -381,39 +358,53 @@ void MainWindow::slotDeleteTag(const QString& tagName)
 
 void MainWindow::openRepo(const QString& path)
 {
-    if (!_git->openRepository(path)) {
-        QMessageBox::warning(this,
-            QStringLiteral("Not a Git Repository"),
-            QStringLiteral("'%1' is not a valid git repository.").arg(path));
-        return;
-    }
-
-    RepoListWidget::recordRepo(path);
-    _repoList->setCurrentRepo(path);
-
-    // 记录为最后一次打开的仓库，供下次启动时恢复
-    QSettings s;
-    s.setValue(QStringLiteral("lastRepo"), path);
-    s.sync();
-
-    _repoLabel->setText(QStringLiteral("  ") + path);
-    setWindowTitle(QStringLiteral("Git Manager — %1").arg(path));
-    refresh();
+    showStatus(QStringLiteral("Opening repository…"));
+    _git->openRepository(path);
 }
 
 void MainWindow::refresh()
 {
     showStatus(QStringLiteral("Refreshing…"));
-    QApplication::processEvents();
+    _git->refresh();
+}
 
-    _commitGraph->setCommits(_git->fetchLog());
-    _branchList->setBranches(_git->fetchBranches());
-    _statusWidget->setFiles(_git->fetchStatus());
+void MainWindow::slotRepositoryOpened(const QString& path, bool success, const QString& error)
+{
+    if (!success) {
+        QMessageBox::warning(this, QStringLiteral("Not a Git Repository"), error);
+        return;
+    }
+    RepoListWidget::recordRepo(path);
+    _repoList->setCurrentRepo(path);
+    QSettings settings;
+    settings.setValue(QStringLiteral("lastRepo"), path);
+    settings.sync();
+    _repoLabel->setText(QStringLiteral("  ") + path);
+    setWindowTitle(QStringLiteral("Git Manager — %1").arg(path));
+}
+
+void MainWindow::slotStateReady(const Git::RepositoryState& state)
+{
+    _state = state;
+    _commitGraph->setCommits(state.commits);
+    _branchList->setBranches(state.branches);
+    _statusWidget->setFiles(state.files);
     _diffWidget->clearDiff();
+    showStatus(QStringLiteral("Ready — %1 [%2] %3")
+        .arg(state.rootPath, state.displayHead(), state.syncText()));
+}
 
-    showStatus(QStringLiteral("Ready — %1  [%2]")
-        .arg(_git->repositoryPath())
-        .arg(_git->currentBranch()));
+void MainWindow::slotOperationFinished(const QString& operation, bool success, const QString& message)
+{
+    showStatus(success ? QStringLiteral("%1 completed. %2").arg(operation, message)
+                       : QStringLiteral("%1 failed.").arg(operation));
+}
+
+void MainWindow::slotBusyChanged(bool busy)
+{
+    _cancelAction->setEnabled(busy);
+    for (QAction* action : _repositoryActions)
+        action->setEnabled(!busy && _git->isValid());
 }
 
 void MainWindow::showStatus(const QString& msg)

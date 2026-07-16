@@ -27,10 +27,13 @@ struct Commit {
 /** @brief 分支信息 */
 struct Branch {
     QString name;
+    QString fullName;
     QString hash;
     bool isCurrent  {false};
     bool isRemote   {false};
     QString upstream;
+    int ahead {0};
+    int behind {0};
 };
 
 /** @brief 文件状态 */
@@ -42,6 +45,8 @@ struct File {
         E_Deleted    = 'D',
         E_Renamed    = 'R',
         E_Copied     = 'C',
+        E_TypeChanged= 'T',
+        E_Unmerged   = 'U',
         E_Untracked  = '?',
         E_Ignored    = '!'
     };
@@ -50,6 +55,9 @@ struct File {
     QString originalPath;  // rename 时的旧路径
     Status  indexStatus   {Status::E_Unmodified};
     Status  workStatus    {Status::E_Unmodified};
+    QString submoduleState;
+    bool tracked {true};
+    bool conflicted {false};
 
     /** @brief 返回简短的状态字符串，如 "M " "??" */
     QString statusText() const {
@@ -66,6 +74,17 @@ struct File {
     bool isUnstaged() const {
         return workStatus != Status::E_Unmodified;
     }
+};
+
+struct StatusSummary {
+    QString headName;
+    QString headHash;
+    QString upstream;
+    int ahead {0};
+    int behind {0};
+    bool detached {false};
+    bool unborn {false};
+    QVector<File> files;
 };
 
 // 图形绘制用的 lane 颜色列表

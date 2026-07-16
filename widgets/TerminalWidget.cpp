@@ -1,6 +1,8 @@
 #include "TerminalWidget.h"
 #include <QScrollBar>
 #include <QDateTime>
+#include <QContextMenuEvent>
+#include <QMenu>
 
 TerminalWidget::TerminalWidget(QWidget* parent)
     : QPlainTextEdit(parent)
@@ -8,6 +10,7 @@ TerminalWidget::TerminalWidget(QWidget* parent)
     setReadOnly(true);
     setMaximumBlockCount(5000);
     setLineWrapMode(QPlainTextEdit::NoWrap);
+    setContextMenuPolicy(Qt::DefaultContextMenu);
 
     QFont mono(QStringLiteral("Consolas"), 9);
     mono.setStyleHint(QFont::Monospace);
@@ -20,6 +23,33 @@ TerminalWidget::TerminalWidget(QWidget* parent)
         "  border: none;"
         "  border-top: 1px solid #30363d;"
         "}"));
+}
+
+void TerminalWidget::contextMenuEvent(QContextMenuEvent* event)
+{
+    QMenu* menu = createStandardContextMenu();
+    menu->addSeparator();
+    QAction* clearAction = menu->addAction(QStringLiteral("Clear Git Output"));
+    connect(clearAction, &QAction::triggered, this, &QPlainTextEdit::clear);
+    menu->exec(event->globalPos());
+    delete menu;
+}
+
+void TerminalWidget::beginCommand(const QString& command)
+{
+    appendCommand(command, {}, true);
+}
+
+void TerminalWidget::appendOutput(const QString& output, bool standardError)
+{
+    if (output.isEmpty()) return;
+    QTextCursor cursor = textCursor();
+    cursor.movePosition(QTextCursor::End);
+    QTextCharFormat format;
+    format.setForeground(standardError ? QColor("#f0883e") : QColor("#8b949e"));
+    cursor.setCharFormat(format);
+    cursor.insertText(output);
+    verticalScrollBar()->setValue(verticalScrollBar()->maximum());
 }
 
 void TerminalWidget::appendCommand(const QString& command,

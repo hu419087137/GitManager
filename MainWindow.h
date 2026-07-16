@@ -14,6 +14,7 @@ class TerminalWidget;
 class QSplitter;
 class QLabel;
 class QTabWidget;
+class QAction;
 
 /**
  * @brief 主窗口
@@ -39,13 +40,14 @@ private slots:
     void slotPull();
     void slotPush();
     void slotCommit();
+    void slotCancelOperation();
 
     // ---- 仓库切换 ----
     void slotRepoSelected(const QString& path);
 
     // ---- 子控件信号 ----
     void slotCommitSelected(const Git::Commit& commit);
-    void slotFileSelected(const QString& filePath, bool staged);
+    void slotFileSelected(const QString& filePath, bool staged, bool untracked);
     void slotStageFile(const QString& filePath);
     void slotUnstageFile(const QString& filePath);
     void slotStageAll();
@@ -61,6 +63,10 @@ private slots:
 
     // ---- 错误处理 ----
     void slotGitError(const QString& message);
+    void slotRepositoryOpened(const QString& path, bool success, const QString& error);
+    void slotStateReady(const Git::RepositoryState& state);
+    void slotOperationFinished(const QString& operation, bool success, const QString& message);
+    void slotBusyChanged(bool busy);
 
 private:
     void setupToolBar();
@@ -86,6 +92,9 @@ private:
     QTabWidget*        _rightTabs        {nullptr};
     TerminalWidget*    _terminalWidget   {nullptr};
     QLabel*            _repoLabel        {nullptr};
+    QAction*           _cancelAction     {nullptr};
+    QList<QAction*>    _repositoryActions;
+    Git::RepositoryState _state;
 };
 
 #endif // MAINWINDOW_H

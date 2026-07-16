@@ -83,7 +83,18 @@ cmake --build build --config Release
 4. 在右侧 **Status** 页暂存或取消暂存文件，选择文件可在 **Diff** 页查看差异。
 5. 暂存文件后点击 **Commit** 填写提交信息；使用工具栏执行 Pull 或 Push。
 
-Pull 操作会在工作区不干净时自动创建临时 stash，执行 `pull --rebase` 后再恢复改动。如果恢复时发生冲突，需要在仓库中手动解决。
+Pull 使用 Git 的 `pull --rebase --autostash`，工作区不干净时由 Git 自动临时保存并恢复改动。如果恢复时发生冲突，需要在仓库中手动解决。
+
+## 测试
+
+配置时启用测试并完成构建后，可以执行：
+
+```powershell
+& "D:/Qt/6.7.3/Tools/CMake_64/bin/ctest.exe" `
+  --test-dir build/Release --output-on-failure -C Release
+```
+
+测试覆盖 Porcelain v2 状态解析、分支分类、空仓库、detached HEAD、特殊路径、stash 冲突，以及异步命令的失败、超时和取消。
 
 ## 开发计划
 
@@ -103,6 +114,6 @@ GitManager/
 
 ## 注意事项
 
-- 当前 Git 操作是同步执行的，超时时间为 15 秒；大型仓库或网络较慢时操作可能暂时阻塞界面。
+- Git 操作通过异步队列执行，本地命令默认超时为 30 秒，网络命令可通过工具栏的 **Cancel** 主动取消。
 - Push、Pull 和远程分支操作依赖仓库自身已配置的远程地址及 Git 凭据。
 - 删除分支、强制删除分支等操作会直接修改当前仓库，请确认后再执行。

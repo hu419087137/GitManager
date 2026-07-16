@@ -1,111 +1,74 @@
 #ifndef GITMANAGER_H
 #define GITMANAGER_H
 
-#include "GitTypes.h"
+#include "GitCommandRunner.h"
+#include "RepositoryState.h"
+#include <QHash>
 #include <QObject>
 
 namespace Git {
 
-/**
- * @brief Git 仓库操作封装，通过 QProcess 调用 git 命令行
- *
- * 所有读取操作均为同步阻塞式；写入操作（commit/checkout 等）
- * 成功时返回 true，失败时发射 sigError() 并返回 false。
- */
 class GitManager : public QObject {
     Q_OBJECT
 
 public:
     explicit GitManager(QObject* parent = nullptr);
 
-    /** @brief 打开指定路径的 git 仓库，成功返回 true */
-    bool openRepository(const QString& path);
-
     QString repositoryPath() const { return _repoPath; }
-    bool    isValid() const        { return _isValid; }
+    bool isValid() const { return _isValid; }
+    bool isBusy() const { return _runner.isBusy(); }
 
-    // -------- 数据查询 --------
+    void openRepository(const QString& path);
+    void refresh();
+    void cancelAll();
+    void fetchFileDiff(const QString& filePath, bool staged, bool untracked = false);
+    void fetchCommitDiff(const QString& commitHash);
 
-    /** @brief 获取提交历史，含 lane 布局信息（--topo-order）*/
-    QVector<Commit>  fetchLog(int maxCount = 1000);
-
-    /** @brief 获取本地及远端分支列表 */
-    QVector<Branch>  fetchBranches();
-
-    /** @brief 获取工作区文件状态（git status --porcelain=v1）*/
-    QVector<File>    fetchStatus();
-
-    /** @brief 获取单个文件的 diff（staged=true 则为暂存区 diff）*/
-    QString          fetchFileDiff(const QString& filePath, bool staged = false);
-
-    /** @brief 获取某次提交的完整 diff（git show）*/
-    QString          fetchCommitDiff(const QString& commitHash);
-
-    /** @brief 获取当前分支名 */
-    QString          currentBranch();
-
-    // -------- Git 操作 --------
-
-    bool stageFile(const QString& filePath);
-    bool unstageFile(const QString& filePath);
-    bool stageAll();
-    bool unstageAll();
-
-    /**
-     * @brief 将文件路径追加到仓库根目录的 .gitignore
-     * @return 文件写入成功返回 true
-     */
+    void stageFile(const QString& filePath);
+    void unstageFile(const QString& filePath);
+    void stageAll();
+    void unstageAll();
     bool addToGitIgnore(const QString& filePath);
-
-    bool commit(const QString& message);
-
-    bool checkoutBranch(const QString& branchName);
-    bool createBranch(const QString& branchName, const QString& from = QString());
-    bool deleteBranch(const QString& branchName, bool force = false);
-
-    bool pull();
-    bool push();
-
-    /**
-     * @brief 在指定提交处创建标签
-     * @param tagName     标签名
-     * @param commitHash  目标提交 hash（空则指向 HEAD）
-     * @param message     附注消息；非空则创建附注标签（-a），否则创建轻量标签
-     */
-    bool createTag(const QString& tagName,
-                   const QString& commitHash,
-                   const QString& message = QString());
-
-    /**
-     * @brief 删除本地标签
-     * @param tagName  要删除的标签名
-     */
-    bool deleteTag(const QString& tagName);
+    void commit(const QString& message);
+    void checkoutBranch(const QString& branchName);
+    void createBranch(const QString& branchName, const QString& from = {});
+    void deleteBranch(const QString& branchName, bool force = false);
+    void pull();
+    void push();
+    void createTag(const QString& tagName, const QString& commitHash,
+                   const QString& message = {});
+    void deleteTag(const QString& tagName);
 
 signals:
-    /** @brief git 命令执行出错时发射，包含 stderr 内容 */
+    void sigRepositoryOpened(const QString& path, bool success, const QString& error);
+    void sigStateReady(const Git::RepositoryState& state);
+    void sigDiffReady(const QString& diff, const QString& title);
+    void sigOperationFinished(const QString& operation, bool success, const QString& message);
     void sigError(const QString& message);
-
-    /** @brief 操作进度提示（非错误），可直接显示在状态栏 */
     void sigInfo(const QString& message);
-
-    /**
-     * @brief 每条 git 命令执行完毕后发射
-     * @param command  完整命令字符串，如 "git pull --rebase"
-     * @param output   命令输出（只读查询为空）
-     * @param success  是否以 exit code 0 结束
-     */
+    void sigCommandStarted(const QString& command);
+    void sigCommandOutput(const QString& output, bool standardError);
     void sigCommandRun(const QString& command, const QString& output, bool success);
+    void sigBusyChanged(bool busy);
 
 private:
-    /** @brief 同步执行 git 命令，返回 stdout；失败时通过 ok 输出 false */
-    QString runGit(const QStringList& args, bool* ok = nullptr) const;
+    struct RequestContext { quint64 generation; QString operation; QString command; };
 
-    /** @brief 为提交列表计算 lane（列）布局，用于图形绘制 */
+    quint64 run(const QString& operation, const QStringList& arguments,
+                bool network = false, int timeoutMs = -1);
+    void handleResult(const GitResult& result);
+    void handleRefreshPart(const GitResult& result);
+    void emitResultError(const GitResult& result);
+    static QVector<Commit> parseLog(const QByteArray& output);
     static void assignLanes(QVector<Commit>& commits);
 
+    GitCommandRunner _runner;
     QString _repoPath;
-    bool    _isValid {false};
+    bool _isValid {false};
+    quint64 _generation {0};
+    QHash<quint64, RequestContext> _contexts;
+    RepositoryState _pendingState;
+    int _pendingRefreshParts {0};
 };
 
 } // namespace Git

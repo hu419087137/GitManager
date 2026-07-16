@@ -55,11 +55,11 @@ tests/
 
 新增文件：
 
-- [ ] `core/GitResult.h`
+- [x] `core/GitResult.h`
   - 保存命令、标准输出、标准错误、退出码、取消状态和错误类型。
   - 区分“命令失败”和 `git diff` 的“发现差异”退出码。
-- [ ] `core/GitCommandRunner.h`
-- [ ] `core/GitCommandRunner.cpp`
+- [x] `core/GitCommandRunner.h`
+- [x] `core/GitCommandRunner.cpp`
   - 使用持久化 `QProcess` 和信号异步读取输出。
   - 支持本地命令、网络命令使用不同超时策略。
   - 支持取消、实时输出、执行状态和仓库工作目录。
@@ -67,20 +67,20 @@ tests/
 
 修改文件：
 
-- [ ] `core/GitManager.h`
-- [ ] `core/GitManager.cpp`
+- [x] `core/GitManager.h`
+- [x] `core/GitManager.cpp`
   - 移除同步 `waitForFinished()` 和 `const_cast` 发信号方式。
   - 将查询与写操作逐步改为异步接口。
-- [ ] `widgets/TerminalWidget.h`
-- [ ] `widgets/TerminalWidget.cpp`
+- [x] `widgets/TerminalWidget.h`
+- [x] `widgets/TerminalWidget.cpp`
   - 改名或显示标题为“Git 输出”。
   - 支持实时追加 stdout/stderr、复制和清空日志。
-- [ ] `MainWindow.h`
-- [ ] `MainWindow.cpp`
+- [x] `MainWindow.h`
+- [x] `MainWindow.cpp`
   - 命令执行时显示进度并禁用冲突操作。
   - 删除 `QApplication::processEvents()`。
   - 支持取消长时间运行的操作。
-- [ ] `CMakeLists.txt`
+- [x] `CMakeLists.txt`
   - 加入新增源码。
 
 验收标准：
@@ -94,24 +94,24 @@ tests/
 
 新增文件：
 
-- [ ] `core/parsers/StatusParser.h`
-- [ ] `core/parsers/StatusParser.cpp`
+- [x] `core/parsers/StatusParser.h`
+- [x] `core/parsers/StatusParser.cpp`
   - 解析 `git -c core.quotepath=false status --porcelain=v2 -z --branch`。
   - 支持普通修改、重命名、复制、未跟踪文件、冲突和子模块。
 
 修改文件：
 
-- [ ] `core/GitTypes.h`
+- [x] `core/GitTypes.h`
   - 扩展 `File` 类型，分别保存 index、worktree、conflict、tracked 和 submodule 状态。
   - 增加分支 ahead/behind、upstream 和 detached HEAD 信息。
-- [ ] `core/GitManager.cpp`
+- [x] `core/GitManager.cpp`
   - 使用 NUL 分隔输出，不再用字符串拆分 `old -> new`。
-- [ ] `widgets/StatusWidget.h`
-- [ ] `widgets/StatusWidget.cpp`
+- [x] `widgets/StatusWidget.h`
+- [x] `widgets/StatusWidget.cpp`
   - 分为 `Merge Changes`、`Changes`、`Staged Changes` 三组。
   - 同一个 `MM` 文件分别出现在工作区和暂存区列表中。
   - 显示准确的状态、路径和提示信息。
-- [ ] `MainWindow.cpp`
+- [x] `MainWindow.cpp`
   - 点击不同分组的文件时加载对应 diff。
 
 验收标准：
@@ -125,20 +125,20 @@ tests/
 
 新增文件：
 
-- [ ] `core/parsers/BranchParser.h`
-- [ ] `core/parsers/BranchParser.cpp`
-- [ ] `core/RepositoryState.h`
-- [ ] `core/RepositoryState.cpp`
+- [x] `core/parsers/BranchParser.h`
+- [x] `core/parsers/BranchParser.cpp`
+- [x] `core/RepositoryState.h`
+- [x] `core/RepositoryState.cpp`
 
 修改文件：
 
-- [ ] `core/GitManager.cpp`
+- [x] `core/GitManager.cpp`
   - 根据 `refs/heads/` 和 `refs/remotes/` 判断分支类型。
   - 不再使用名称中是否包含 `/` 判断远程分支。
   - 支持 detached HEAD、空仓库和 unborn branch。
-- [ ] `widgets/BranchListWidget.cpp`
+- [x] `widgets/BranchListWidget.cpp`
   - 显示 ahead/behind、upstream 和当前 HEAD 状态。
-- [ ] `MainWindow.cpp`
+- [x] `MainWindow.cpp`
   - 状态栏显示当前分支及同步状态。
 
 验收标准：
@@ -151,23 +151,23 @@ tests/
 
 新增文件：
 
-- [ ] `tests/CMakeLists.txt`
-- [ ] `tests/unit/TestStatusParser.cpp`
-- [ ] `tests/unit/TestBranchParser.cpp`
-- [ ] `tests/integration/TestRepository.cpp`
+- [x] `tests/CMakeLists.txt`
+- [x] `tests/unit/TestStatusParser.cpp`
+- [x] `tests/unit/TestBranchParser.cpp`
+- [x] `tests/integration/TestRepository.cpp`
 
 修改文件：
 
-- [ ] `CMakeLists.txt`
+- [x] `CMakeLists.txt`
   - 引入 `CTest` 和 Qt Test，提供 `BUILD_TESTING` 开关。
 
 覆盖场景：
 
-- [ ] 空仓库、detached HEAD、普通分支和远程分支。
-- [ ] staged、unstaged、`MM`、rename、delete、untracked。
-- [ ] 中文、空格、引号和特殊字符路径。
-- [ ] 合并冲突和 stash 冲突。
-- [ ] Git 命令超时、取消和失败。
+- [x] 空仓库、detached HEAD、普通分支和远程分支。
+- [x] staged、unstaged、`MM`、rename、delete、untracked。
+- [x] 中文、空格、引号和特殊字符路径。
+- [x] 合并冲突和 stash 冲突。
+- [x] Git 命令超时、取消和失败。
 
 验收标准：
 
@@ -460,7 +460,7 @@ tests/
 - [x] Commit、Pull、Push 和标签基础操作
 - [x] Git 命令输出面板
 - [x] README、构建环境和运行截图
-- [ ] 第一阶段：可靠的 Git 基础层
+- [x] 第一阶段：可靠的 Git 基础层
 - [ ] 第二阶段：VS Code Git 核心体验
 - [ ] 第三阶段：高级历史操作
 - [ ] 第四阶段：专业仓库能力
