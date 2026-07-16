@@ -21,6 +21,24 @@ private slots:
         QVERIFY2(backend.stage(QStringLiteral("中文 file.txt"),&error),qPrintable(error));
         state=backend.snapshot(&error); QVERIFY(state.files[0].isStaged());
     }
+
+    void bundledOpenSslHttpsClone()
+    {
+#ifndef GITMANAGER_BUNDLED_OPENSSL
+        QSKIP("This build does not use the bundled prebuilt OpenSSL package.");
+#else
+        const QByteArray remoteUrl = qgetenv("GITMANAGER_TEST_HTTPS_URL");
+        if (remoteUrl.isEmpty())
+            QSKIP("Set GITMANAGER_TEST_HTTPS_URL to run the optional HTTPS clone test.");
+
+        QTemporaryDir dir; QVERIFY(dir.isValid());
+        Git::LibGit2Backend backend; QString error;
+        const QString checkoutPath = dir.filePath(QStringLiteral("https-clone"));
+        QVERIFY2(backend.clone(QString::fromUtf8(remoteUrl), checkoutPath, &error),
+                 qPrintable(error));
+        QVERIFY(backend.isOpen());
+#endif
+    }
 };
 QTEST_GUILESS_MAIN(TestLibGit2Backend)
 #include "TestLibGit2Backend.moc"

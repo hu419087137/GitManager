@@ -3,7 +3,9 @@
 #include <git2.h>
 #include <git2/sys/errors.h>
 
+#include <QCoreApplication>
 #include <QDateTime>
+#include <QDebug>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -378,11 +380,36 @@ QString diffText(git_diff* diff, QString* error, const QString& fallback)
     return result;
 }
 
+void configureBundledOpenSslCertificates()
+{
+#ifdef GITMANAGER_BUNDLED_OPENSSL
+    const QString certificatePath = QDir(QCoreApplication::applicationDirPath())
+                                        .filePath(QStringLiteral("certs/cacert.pem"));
+    if (!QFileInfo(certificatePath).isFile()) {
+        qWarning().noquote() << "Bundled OpenSSL CA certificate bundle is missing:"
+                             << certificatePath;
+        return;
+    }
+
+    const QByteArray nativePath = QDir::toNativeSeparators(certificatePath).toUtf8();
+    if (git_libgit2_opts(GIT_OPT_SET_SSL_CERT_LOCATIONS,
+                         nativePath.constData(), nullptr) < 0) {
+        const git_error* error = git_error_last();
+        qWarning().noquote() << "Cannot configure bundled OpenSSL CA certificate bundle:"
+                             << (error && error->message
+                                     ? QString::fromUtf8(error->message)
+                                     : certificatePath);
+        git_error_clear();
+    }
+#endif
+}
+
 } // namespace
 
 LibGit2Backend::LibGit2Backend()
 {
-    git_libgit2_init();
+    if (git_libgit2_init() > 0)
+        configureBundledOpenSslCertificates();
 }
 
 LibGit2Backend::~LibGit2Backend()

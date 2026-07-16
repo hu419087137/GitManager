@@ -18,18 +18,26 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(BUILD_CLI OFF CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-option(GITMANAGER_BUILD_BUNDLED_OPENSSL "Build bundled OpenSSL 3.0.16 (requires a complete Perl installation)" OFF)
-if(GITMANAGER_BUILD_BUNDLED_OPENSSL)
-    set(OPENSSL_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+if(WIN32 AND MSVC)
+    set(_gitmanager_prebuilt_openssl_default ON)
+else()
+    set(_gitmanager_prebuilt_openssl_default OFF)
+endif()
+option(GITMANAGER_USE_PREBUILT_OPENSSL "Use bundled prebuilt OpenSSL 3.0.16" ${_gitmanager_prebuilt_openssl_default})
+unset(_gitmanager_prebuilt_openssl_default)
+if(DEFINED GITMANAGER_BUILD_BUNDLED_OPENSSL)
+    message(STATUS "Removing obsolete GITMANAGER_BUILD_BUNDLED_OPENSSL cache option")
+    unset(GITMANAGER_BUILD_BUNDLED_OPENSSL CACHE)
+endif()
+if(NOT GITMANAGER_USE_PREBUILT_OPENSSL)
+    foreach(_openssl_cache_variable IN ITEMS
+            OPENSSL_ROOT_DIR OPENSSL_INCLUDE_DIR OPENSSL_SSL_LIBRARY
+            OPENSSL_CRYPTO_LIBRARY OPENSSL_VERSION)
+        unset(${_openssl_cache_variable} CACHE)
+    endforeach()
+endif()
+if(GITMANAGER_USE_PREBUILT_OPENSSL)
     add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/third_party/OpenSSLv3.0.16" "${CMAKE_BINARY_DIR}/third_party/openssl" EXCLUDE_FROM_ALL)
-    if(NOT OPENSSL_SSL_LIB OR NOT OPENSSL_CRYPTO_LIB)
-        message(FATAL_ERROR "Bundled OpenSSL did not export its library paths")
-    endif()
-    set(OPENSSL_ROOT_DIR "${OPENSSL_INSTALL_DIR}" CACHE PATH "" FORCE)
-    set(OPENSSL_INCLUDE_DIR "${OPENSSL_ROOT_DIR}/include" CACHE PATH "" FORCE)
-    set(OPENSSL_SSL_LIBRARY "${OPENSSL_SSL_LIB}" CACHE FILEPATH "" FORCE)
-    set(OPENSSL_CRYPTO_LIBRARY "${OPENSSL_CRYPTO_LIB}" CACHE FILEPATH "" FORCE)
-    set(OPENSSL_USE_STATIC_LIBS ON CACHE BOOL "" FORCE)
     set(USE_HTTPS OpenSSL CACHE STRING "" FORCE)
 elseif(WIN32)
     set(USE_HTTPS WinHTTP CACHE STRING "" FORCE)
@@ -45,11 +53,67 @@ message(STATUS "GitManager compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPIL
 message(STATUS "GitManager Qt: ${Qt6_VERSION} (${Qt6_DIR})")
 message(STATUS "GitManager HTTPS backend: ${USE_HTTPS}")
 add_subdirectory("${LIBGIT2_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/third_party/libgit2" EXCLUDE_FROM_ALL)
-if(GITMANAGER_BUILD_BUNDLED_OPENSSL)
-    add_dependencies(util openssl)
-    add_dependencies(libgit2 openssl)
-    add_dependencies(libgit2package openssl)
-endif()
+
+function(gitmanager_configure_openssl_target target_name)
+    if(NOT GITMANAGER_USE_PREBUILT_OPENSSL)
+        return()
+    endif()
+    if(NOT TARGET "${target_name}")
+        message(FATAL_ERROR "Cannot deploy OpenSSL for unknown target: ${target_name}")
+    endif()
+
+    target_compile_definitions("${target_name}" PRIVATE GITMANAGER_BUNDLED_OPENSSL)
+    if(UNIX AND NOT APPLE AND OPENSSL_SSL_RUNTIME)
+        set_property(TARGET "${target_name}" APPEND PROPERTY BUILD_RPATH "$ORIGIN")
+        set_property(TARGET "${target_name}" APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
+    endif()
+endfunction()
+
+function(gitmanager_add_openssl_deployment deployment_target output_target)
+    if(NOT GITMANAGER_USE_PREBUILT_OPENSSL)
+        return()
+    endif()
+    if(TARGET "${deployment_target}")
+        message(FATAL_ERROR "OpenSSL deployment target already exists: ${deployment_target}")
+    endif()
+
+    set(_deployment_consumers "${output_target}" ${ARGN})
+    foreach(_consumer IN LISTS _deployment_consumers)
+        if(NOT TARGET "${_consumer}")
+            message(FATAL_ERROR "Cannot deploy OpenSSL for unknown target: ${_consumer}")
+        endif()
+    endforeach()
+
+    set(_deployment_sources "${OPENSSL_CA_BUNDLE}")
+    if(OPENSSL_SSL_RUNTIME AND OPENSSL_CRYPTO_RUNTIME)
+        list(APPEND _deployment_sources
+            "${OPENSSL_SSL_RUNTIME}"
+            "${OPENSSL_CRYPTO_RUNTIME}")
+        add_custom_target("${deployment_target}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:${output_target}>/certs"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${OPENSSL_CA_BUNDLE}"
+                    "$<TARGET_FILE_DIR:${output_target}>/certs/cacert.pem"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${OPENSSL_SSL_RUNTIME}"
+                    "${OPENSSL_CRYPTO_RUNTIME}"
+                    "$<TARGET_FILE_DIR:${output_target}>"
+            DEPENDS ${_deployment_sources}
+            VERBATIM)
+    else()
+        add_custom_target("${deployment_target}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:${output_target}>/certs"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${OPENSSL_CA_BUNDLE}"
+                    "$<TARGET_FILE_DIR:${output_target}>/certs/cacert.pem"
+            DEPENDS ${_deployment_sources}
+            VERBATIM)
+    endif()
+
+    foreach(_consumer IN LISTS _deployment_consumers)
+        add_dependencies("${_consumer}" "${deployment_target}")
+    endforeach()
+endfunction()
 
 set(SOURCES
     main.cpp
@@ -91,6 +155,8 @@ target_link_libraries(${PROJECT_NAME}
     Qt6::Concurrent
     libgit2package
 )
+gitmanager_configure_openssl_target(${PROJECT_NAME})
+gitmanager_add_openssl_deployment(GitManagerOpenSSLRuntime ${PROJECT_NAME})
 
 if(WIN32)
     set_target_properties(${PROJECT_NAME} PROPERTIES WIN32_EXECUTABLE TRUE)

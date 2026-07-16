@@ -20,6 +20,10 @@ Makefile
 *.ilk
 *.obj
 
+# 仓库内预编译 OpenSSL 运行库需要随项目保存
+!third_party/OpenSSLv3.0.16/Win_x64/bin/libssl-3-x64.dll
+!third_party/OpenSSLv3.0.16/Win_x64/bin/libcrypto-3-x64.dll
+
 # 操作系统文件
 .DS_Store
 Thumbs.db
