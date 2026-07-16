@@ -1,0 +1,24 @@
+# Qt Creator 本地配置
+.qtcreator/
+*.user
+*.user.*
+
+# CMake 与编译产物
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+Makefile
+
+# 生成的二进制与调试文件
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.obj
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
