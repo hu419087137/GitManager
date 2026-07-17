@@ -64,6 +64,11 @@ private slots:
     void slotCheckoutBranch(const QString& branchName);
     void slotDeleteBranch(const QString& branchName, bool force);
     void slotCreateBranch(const QString& fromBranch);
+    void slotMergeRevision(const QString& revision);
+    void slotRebaseRevision(const QString& revision);
+    void slotCherryPickCommit(const QString& commitHash, int mainline);
+    void slotRevertCommit(const QString& commitHash, int mainline);
+    void slotResetCommit(const QString& commitHash);
 
     // ---- 标签操作 ----
     void slotCreateTag(const QString& commitHash);
@@ -74,6 +79,11 @@ private slots:
     void slotRepositoryOpened(const QString& path, bool success, const QString& error);
     void slotStateReady(const Git::RepositoryState& state);
     void slotOperationFinished(const QString& operation, bool success, const QString& message);
+    void slotResetPreviewReady(const Git::HistoryRewritePreview& preview);
+    void slotRebasePlanReady(const Git::RebasePlan& plan);
+    void slotHistoryOperationFinished(const QString& operation,
+                                      Git::HistoryOperationStatus status,
+                                      const QString& message);
     void slotBusyChanged(bool busy);
 
 private:
@@ -104,7 +114,9 @@ private:
     TerminalWidget*    _terminalWidget   {nullptr};
     QLabel*            _repoLabel        {nullptr};
     QAction*           _cancelAction     {nullptr};
+    QAction*           _operationAction  {nullptr};
     QList<QAction*>    _repositoryActions;
+    QList<QAction*>    _inactiveDuringOperationActions;
     Git::RepositoryState _state;
     QStringList _stashes;
     DiffSource _requestedDiffSource {DiffSource::None};

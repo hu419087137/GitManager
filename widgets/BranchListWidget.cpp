@@ -44,6 +44,7 @@ void BranchListWidget::setBranches(const QVector<Git::Branch>& branches)
         auto* item = new QTreeWidgetItem({displayName});
         item->setData(0, Qt::UserRole,     b.name);
         item->setData(0, Qt::UserRole + 1, b.isRemote);
+        item->setData(0, Qt::UserRole + 2, b.isCurrent);
 
         if (b.isCurrent) {
             // 当前本地分支：加粗 + "* " 前缀
@@ -76,7 +77,7 @@ void BranchListWidget::slotItemDoubleClicked(QTreeWidgetItem* item, int /*column
         return;
 
     const bool isRemote = item->data(0, Qt::UserRole + 1).toBool();
-    if (!isRemote) {
+    if (!isRemote && _operationsEnabled) {
         const QString name = item->data(0, Qt::UserRole).toString();
         emit sigCheckoutRequested(name);
     }
@@ -90,18 +91,36 @@ void BranchListWidget::slotContextMenu(const QPoint& pos)
 
     const QString name     = item->data(0, Qt::UserRole).toString();
     const bool    isRemote = item->data(0, Qt::UserRole + 1).toBool();
+    const bool    isCurrent = item->data(0, Qt::UserRole + 2).toBool();
 
     QMenu menu(this);
 
     if (!isRemote) {
-        menu.addAction(QStringLiteral("Checkout"), [this, name] {
+        QAction* checkout = menu.addAction(QStringLiteral("Checkout"), [this, name] {
             emit sigCheckoutRequested(name);
         });
-        menu.addAction(QStringLiteral("New Branch from Here..."), [this, name] {
+        QAction* createBranch = menu.addAction(QStringLiteral("New Branch from Here..."), [this, name] {
             emit sigCreateFromRequested(name);
         });
+        checkout->setEnabled(_operationsEnabled && !isCurrent);
+        createBranch->setEnabled(_operationsEnabled);
+
         menu.addSeparator();
-        menu.addAction(QStringLiteral("Delete Branch"), [this, name] {
+        QAction* merge = menu.addAction(QStringLiteral("Merge into Current Branch"),
+                                        [this, name] {
+            emit sigMergeRequested(name);
+        });
+        merge->setObjectName(QStringLiteral("branchMergeAction"));
+        QAction* rebase = menu.addAction(QStringLiteral("Rebase Current Branch onto Here..."),
+                                         [this, name] {
+            emit sigRebaseRequested(name);
+        });
+        rebase->setObjectName(QStringLiteral("branchRebaseAction"));
+        merge->setEnabled(_operationsEnabled && !isCurrent);
+        rebase->setEnabled(_operationsEnabled && !isCurrent);
+
+        menu.addSeparator();
+        QAction* deleteBranch = menu.addAction(QStringLiteral("Delete Branch"), [this, name] {
             const auto btn = QMessageBox::question(
                 this,
                 QStringLiteral("Delete Branch"),
@@ -109,7 +128,7 @@ void BranchListWidget::slotContextMenu(const QPoint& pos)
             if (btn == QMessageBox::Yes)
                 emit sigDeleteRequested(name, false);
         });
-        menu.addAction(QStringLiteral("Force Delete Branch"), [this, name] {
+        QAction* forceDelete = menu.addAction(QStringLiteral("Force Delete Branch"), [this, name] {
             const auto btn = QMessageBox::question(
                 this,
                 QStringLiteral("Force Delete"),
@@ -117,13 +136,29 @@ void BranchListWidget::slotContextMenu(const QPoint& pos)
             if (btn == QMessageBox::Yes)
                 emit sigDeleteRequested(name, true);
         });
+        deleteBranch->setEnabled(_operationsEnabled && !isCurrent);
+        forceDelete->setEnabled(_operationsEnabled && !isCurrent);
     } else {
-        menu.addAction(QStringLiteral("Checkout as Local Branch..."), [this, name] {
+        QAction* checkout = menu.addAction(QStringLiteral("Checkout as Local Branch..."), [this, name] {
             // strip "origin/" prefix for local name suggestion
             const QString suggestion = name.mid(name.indexOf('/') + 1);
             emit sigCreateFromRequested(name);
             Q_UNUSED(suggestion)
         });
+        checkout->setEnabled(_operationsEnabled);
+        menu.addSeparator();
+        QAction* merge = menu.addAction(QStringLiteral("Merge into Current Branch"),
+                                        [this, name] {
+            emit sigMergeRequested(name);
+        });
+        merge->setObjectName(QStringLiteral("branchMergeAction"));
+        QAction* rebase = menu.addAction(QStringLiteral("Rebase Current Branch onto Here..."),
+                                         [this, name] {
+            emit sigRebaseRequested(name);
+        });
+        rebase->setObjectName(QStringLiteral("branchRebaseAction"));
+        merge->setEnabled(_operationsEnabled);
+        rebase->setEnabled(_operationsEnabled);
     }
 
     menu.exec(mapToGlobal(pos));

@@ -31,6 +31,14 @@ public:
     void setCommitHistoryQuery(const Git::CommitHistoryQuery& query);
     void reloadCommitHistory();
     void loadMoreCommits();
+    void requestResetPreview(const QString& targetRevision);
+    void requestRebasePlan(const QString& targetRevision);
+    void mergeRevision(const QString& revision);
+    void rebaseOnto(const Git::RebasePlan& plan, bool interactive);
+    void cherryPickCommit(const QString& commitHash, int mainline = 0);
+    void revertCommit(const QString& commitHash, int mainline = 0);
+    void resetToCommit(const Git::HistoryRewritePreview& preview,
+                       Git::ResetMode mode);
     void cancelDiffRequest();
     void fetchFileDiff(const QString& filePath, bool staged, bool untracked = false);
     void fetchCommitDiff(const QString& commitHash);
@@ -68,6 +76,11 @@ signals:
     void sigStateReady(const Git::RepositoryState& state);
     void sigCommitHistoryReady(const Git::CommitHistoryPage& page);
     void sigCommitHistoryLoading(bool loading);
+    void sigResetPreviewReady(const Git::HistoryRewritePreview& preview);
+    void sigRebasePlanReady(const Git::RebasePlan& plan);
+    void sigHistoryOperationFinished(const QString& operation,
+                                     Git::HistoryOperationStatus status,
+                                     const QString& message);
     void sigDiffReady(const QString& diff, const QString& title,
                       bool staged, bool hunkActionsEnabled);
     void sigStashesReady(const QStringList& stashes);
@@ -97,6 +110,7 @@ private:
         bool reportCompletion {false};
         bool refreshAfter {false};
         bool reportError {true};
+        bool refreshOnCancel {false};
     };
 
     void enqueue(const QString& operation,
@@ -104,16 +118,21 @@ private:
                  bool requiresRepository = true,
                  bool reportCompletion = false,
                  bool refreshAfter = false,
-                 bool reportError = true);
+                 bool reportError = true,
+                 bool refreshOnCancel = false);
     void startNext();
     void runBoolean(const QString& operation,
                     std::function<bool(LibGit2Backend&, QString*)> work,
                     bool refreshAfter = true,
                     bool refreshOnError = false);
+    void runHistoryOperation(
+        const QString& operation,
+        std::function<HistoryOperationResult(LibGit2Backend&, QString*)> work);
     void publishState(const RepositoryState& state);
     void requestCommitHistory(bool append);
     void discardQueuedHistoryTasks();
     void discardQueuedDiffTasks();
+    void discardQueuedPreviewTasks();
     void resetCommitHistoryState();
     static size_t stashIndex(const QString& ref);
 
@@ -133,6 +152,7 @@ private:
     bool _historyLoading {false};
     quint64 _historyRequest {0};
     quint64 _diffRequest {0};
+    quint64 _previewRequest {0};
 };
 
 } // namespace Git

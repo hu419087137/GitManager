@@ -2,6 +2,7 @@
 
 #include <git2.h>
 #include <git2/sys/errors.h>
+#include <git2/transaction.h>
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -11,11 +12,28 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QHash>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QRegularExpression>
+#include <QSaveFile>
+#include <QSet>
 #include <algorithm>
+#include <cstring>
+#include <limits>
 #include <utility>
 
 namespace Git {
+
+struct InteractiveRebaseState {
+    RebasePlan plan;
+    bool pausedForEdit {false};
+    int completedIndex {-1};
+    int pendingIndex {-1};
+    QString preActionHead;
+    QString pendingTree;
+};
+
 namespace {
 
 template <typename T, void (*Free)(T*)>
@@ -59,6 +77,7 @@ using SignatureHandle = GitHandle<git_signature, git_signature_free>;
 using StatusListHandle = GitHandle<git_status_list, git_status_list_free>;
 using TreeHandle = GitHandle<git_tree, git_tree_free>;
 using TreeEntryHandle = GitHandle<git_tree_entry, git_tree_entry_free>;
+using TransactionHandle = GitHandle<git_transaction, git_transaction_free>;
 
 QString oidText(const git_oid* oid)
 {
@@ -87,6 +106,17 @@ bool ensureRepository(git_repository* repository, QString* error)
         return true;
     if (error)
         *error = QStringLiteral("No repository is open.");
+    return false;
+}
+
+bool ensureNoActiveOperation(git_repository* repository, QString* error)
+{
+    if (git_repository_state(repository) == GIT_REPOSITORY_STATE_NONE)
+        return true;
+    if (error) {
+        *error = QStringLiteral(
+            "Finish or abort the active repository operation first.");
+    }
     return false;
 }
 
@@ -146,6 +176,542 @@ QString branchNameFromRef(const char* refName)
     if (full.startsWith(QStringLiteral("refs/remotes/")))
         return full.mid(13);
     return full;
+}
+
+HistoryOperationResult historyResult(HistoryOperationStatus status,
+                                     const QString& message)
+{
+    HistoryOperationResult result;
+    result.status = status;
+    result.message = message;
+    return result;
+}
+
+HistoryOperationResult historyFailure(QString* error, const QString& fallback)
+{
+    const QString message = LibGit2Backend::lastError(fallback);
+    if (error)
+        *error = message;
+    return historyResult(HistoryOperationStatus::Completed, message);
+}
+
+RepositoryOperation repositoryOperation(int state)
+{
+    switch (state) {
+    case GIT_REPOSITORY_STATE_NONE:
+        return RepositoryOperation::None;
+    case GIT_REPOSITORY_STATE_MERGE:
+        return RepositoryOperation::Merge;
+    case GIT_REPOSITORY_STATE_REBASE:
+    case GIT_REPOSITORY_STATE_REBASE_INTERACTIVE:
+    case GIT_REPOSITORY_STATE_REBASE_MERGE:
+        return RepositoryOperation::Rebase;
+    case GIT_REPOSITORY_STATE_CHERRYPICK:
+        return RepositoryOperation::CherryPick;
+    case GIT_REPOSITORY_STATE_REVERT:
+        return RepositoryOperation::Revert;
+    default:
+        return RepositoryOperation::Unknown;
+    }
+}
+
+bool repositoryDirty(git_repository* repository, bool* dirty, QString* error)
+{
+    git_status_options options = GIT_STATUS_OPTIONS_INIT;
+    options.show = GIT_STATUS_SHOW_INDEX_AND_WORKDIR;
+    options.flags = GIT_STATUS_OPT_INCLUDE_UNTRACKED
+                  | GIT_STATUS_OPT_RECURSE_UNTRACKED_DIRS
+                  | GIT_STATUS_OPT_RENAMES_HEAD_TO_INDEX
+                  | GIT_STATUS_OPT_RENAMES_INDEX_TO_WORKDIR;
+    StatusListHandle statuses;
+    if (git_status_list_new(statuses.out(), repository, &options) < 0)
+        return fail(error, QStringLiteral("Cannot inspect repository changes."));
+    if (dirty)
+        *dirty = git_status_list_entrycount(statuses.get()) != 0;
+    return true;
+}
+
+bool headDetails(git_repository* repository, QString* hash, QString* branch,
+                 QString* upstream, QString* error)
+{
+    ReferenceHandle head;
+    if (git_repository_head(head.out(), repository) < 0)
+        return fail(error, QStringLiteral("Cannot resolve HEAD."));
+    const git_oid* oid = git_reference_target(head.get());
+    if (!oid)
+        return fail(error, QStringLiteral("Cannot resolve HEAD commit."));
+    if (hash)
+        *hash = oidText(oid);
+    if (branch) {
+        *branch = git_repository_head_detached(repository) == 1
+            ? QString() : text(git_reference_shorthand(head.get()));
+    }
+    if (upstream) {
+        upstream->clear();
+        if (git_repository_head_detached(repository) != 1) {
+            ReferenceHandle upstreamRef;
+            if (git_branch_upstream(upstreamRef.out(), head.get()) == 0)
+                *upstream = text(git_reference_shorthand(upstreamRef.get()));
+            else
+                git_error_clear();
+        }
+    }
+    return true;
+}
+
+bool ensureHistoryOperationStart(git_repository* repository,
+                                 const QString& expectedHead,
+                                 QString* error)
+{
+    if (git_repository_state(repository) != GIT_REPOSITORY_STATE_NONE) {
+        if (error)
+            *error = QStringLiteral("Another repository operation is already in progress.");
+        return false;
+    }
+    bool dirty = false;
+    if (!repositoryDirty(repository, &dirty, error))
+        return false;
+    if (dirty) {
+        if (error) {
+            *error = QStringLiteral(
+                "Commit, stash, or discard all staged, unstaged, and untracked changes first.");
+        }
+        return false;
+    }
+    QString currentHead;
+    if (!headDetails(repository, &currentHead, nullptr, nullptr, error))
+        return false;
+    if (!expectedHead.isEmpty()
+        && currentHead.compare(expectedHead, Qt::CaseInsensitive) != 0) {
+        if (error)
+            *error = QStringLiteral("HEAD changed after the operation was prepared. Refresh and try again.");
+        return false;
+    }
+    return true;
+}
+
+QSet<QString> remoteReachableCommits(git_repository* repository,
+                                     QString* error)
+{
+    QSet<QString> result;
+    RevwalkHandle walk;
+    if (git_revwalk_new(walk.out(), repository) < 0) {
+        fail(error, QStringLiteral("Cannot inspect published history."));
+        return result;
+    }
+
+    git_branch_iterator* iterator = nullptr;
+    if (git_branch_iterator_new(&iterator, repository, GIT_BRANCH_REMOTE) < 0) {
+        fail(error, QStringLiteral("Cannot enumerate remote branches."));
+        return result;
+    }
+    bool pushed = false;
+    git_reference* raw = nullptr;
+    git_branch_t type = GIT_BRANCH_REMOTE;
+    int next = GIT_ITEROVER;
+    while ((next = git_branch_next(&raw, &type, iterator)) == 0) {
+        ReferenceHandle reference(raw);
+        raw = nullptr;
+        ObjectHandle commit;
+        if (git_reference_peel(commit.out(), reference.get(), GIT_OBJECT_COMMIT) == 0) {
+            if (git_revwalk_push(walk.get(), git_object_id(commit.get())) == 0)
+                pushed = true;
+            else {
+                git_branch_iterator_free(iterator);
+                fail(error, QStringLiteral("Cannot walk remote branch history."));
+                return {};
+            }
+        } else {
+            git_error_clear();
+        }
+    }
+    git_branch_iterator_free(iterator);
+    if (next != GIT_ITEROVER) {
+        fail(error, QStringLiteral("Cannot enumerate remote branches."));
+        return {};
+    }
+    if (!pushed)
+        return result;
+
+    git_revwalk_sorting(walk.get(), GIT_SORT_TOPOLOGICAL | GIT_SORT_TIME);
+    git_oid oid;
+    int rc = 0;
+    while ((rc = git_revwalk_next(&oid, walk.get())) == 0)
+        result.insert(oidText(&oid));
+    if (rc != GIT_ITEROVER) {
+        fail(error, QStringLiteral("Cannot inspect published history."));
+        return {};
+    }
+    git_error_clear();
+    return result;
+}
+
+QVector<QString> commitsBetween(git_repository* repository,
+                                const git_oid* head, const git_oid* upstream,
+                                QString* error)
+{
+    QVector<QString> result;
+    RevwalkHandle walk;
+    if (git_revwalk_new(walk.out(), repository) < 0
+        || git_revwalk_push(walk.get(), head) < 0
+        || git_revwalk_hide(walk.get(), upstream) < 0) {
+        fail(error, QStringLiteral("Cannot inspect affected commits."));
+        return result;
+    }
+    git_revwalk_sorting(walk.get(), GIT_SORT_TOPOLOGICAL | GIT_SORT_TIME);
+    git_oid oid;
+    int rc = 0;
+    while ((rc = git_revwalk_next(&oid, walk.get())) == 0)
+        result.append(oidText(&oid));
+    if (rc != GIT_ITEROVER) {
+        fail(error, QStringLiteral("Cannot inspect affected commits."));
+        result.clear();
+    }
+    git_error_clear();
+    return result;
+}
+
+QString interactiveRebasePath(git_repository* repository)
+{
+    const char* gitDir = git_repository_path(repository);
+    return gitDir
+        ? QDir(QString::fromUtf8(gitDir))
+              .filePath(QStringLiteral("rebase-merge/gitmanager.json"))
+        : QString();
+}
+
+QString legacyInteractiveRebasePath(git_repository* repository)
+{
+    const char* gitDir = git_repository_path(repository);
+    return gitDir
+        ? QDir(QString::fromUtf8(gitDir))
+              .filePath(QStringLiteral("gitmanager-rebase.json"))
+        : QString();
+}
+
+bool jsonInteger(const QJsonValue& value, int* result)
+{
+    if (!value.isDouble())
+        return false;
+    const int converted = value.toInt(std::numeric_limits<int>::min());
+    if (converted == std::numeric_limits<int>::min()
+        || value.toDouble() != static_cast<double>(converted)) {
+        return false;
+    }
+    if (result)
+        *result = converted;
+    return true;
+}
+
+bool validOidText(const QString& value)
+{
+    if (value.size() != GIT_OID_SHA1_HEXSIZE)
+        return false;
+    git_oid oid;
+    const QByteArray bytes = value.toLatin1();
+    const bool valid = git_oid_fromstr(&oid, bytes.constData()) == 0;
+    git_error_clear();
+    return valid;
+}
+
+QJsonObject previewJson(const HistoryRewritePreview& preview)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("revision"), preview.revision);
+    object.insert(QStringLiteral("targetHash"), preview.targetHash);
+    object.insert(QStringLiteral("expectedHead"), preview.expectedHead);
+    object.insert(QStringLiteral("currentBranch"), preview.currentBranch);
+    object.insert(QStringLiteral("upstream"), preview.upstream);
+    object.insert(QStringLiteral("affectedCount"), preview.affectedCount);
+    object.insert(QStringLiteral("publishedCount"), preview.publishedCount);
+    object.insert(QStringLiteral("dirty"), preview.dirty);
+    object.insert(QStringLiteral("activeOperation"),
+                  static_cast<int>(preview.activeOperation));
+    return object;
+}
+
+bool previewFromJson(const QJsonObject& object,
+                     HistoryRewritePreview* preview)
+{
+    const QJsonValue revision = object.value(QStringLiteral("revision"));
+    const QJsonValue targetHash = object.value(QStringLiteral("targetHash"));
+    const QJsonValue expectedHead = object.value(QStringLiteral("expectedHead"));
+    const QJsonValue currentBranch = object.value(QStringLiteral("currentBranch"));
+    const QJsonValue upstream = object.value(QStringLiteral("upstream"));
+    const QJsonValue dirty = object.value(QStringLiteral("dirty"));
+    if (!revision.isString() || !targetHash.isString()
+        || !expectedHead.isString() || !currentBranch.isString()
+        || !upstream.isString() || !dirty.isBool()) {
+        return false;
+    }
+
+    int affectedCount = -1;
+    int publishedCount = -1;
+    int activeOperation = -1;
+    if (!jsonInteger(object.value(QStringLiteral("affectedCount")),
+                     &affectedCount)
+        || !jsonInteger(object.value(QStringLiteral("publishedCount")),
+                        &publishedCount)
+        || !jsonInteger(object.value(QStringLiteral("activeOperation")),
+                        &activeOperation)
+        || affectedCount < 0 || publishedCount < 0
+        || activeOperation < static_cast<int>(RepositoryOperation::None)
+        || activeOperation > static_cast<int>(RepositoryOperation::Unknown)
+        || !validOidText(targetHash.toString())
+        || !validOidText(expectedHead.toString())) {
+        return false;
+    }
+
+    if (preview) {
+        preview->revision = revision.toString();
+        preview->targetHash = targetHash.toString();
+        preview->expectedHead = expectedHead.toString();
+        preview->currentBranch = currentBranch.toString();
+        preview->upstream = upstream.toString();
+        preview->affectedCount = affectedCount;
+        preview->publishedCount = publishedCount;
+        preview->dirty = dirty.toBool();
+        preview->activeOperation =
+            static_cast<RepositoryOperation>(activeOperation);
+    }
+    return true;
+}
+
+QJsonObject rebaseStateJson(const InteractiveRebaseState& state)
+{
+    QJsonObject root;
+    root.insert(QStringLiteral("version"), 2);
+    root.insert(QStringLiteral("pausedForEdit"), state.pausedForEdit);
+    root.insert(QStringLiteral("completedIndex"), state.completedIndex);
+    root.insert(QStringLiteral("pendingIndex"), state.pendingIndex);
+    root.insert(QStringLiteral("preActionHead"), state.preActionHead);
+    root.insert(QStringLiteral("pendingTree"), state.pendingTree);
+    root.insert(QStringLiteral("preview"), previewJson(state.plan.preview));
+    QJsonArray items;
+    for (const RebasePlanItem& item : state.plan.items) {
+        QJsonObject value;
+        value.insert(QStringLiteral("hash"), item.hash);
+        value.insert(QStringLiteral("subject"), item.subject);
+        value.insert(QStringLiteral("message"), item.message);
+        value.insert(QStringLiteral("action"), static_cast<int>(item.action));
+        value.insert(QStringLiteral("rewrittenMessage"), item.rewrittenMessage);
+        value.insert(QStringLiteral("published"), item.published);
+        value.insert(QStringLiteral("parentCount"), item.parentCount);
+        items.append(value);
+    }
+    root.insert(QStringLiteral("items"), items);
+    return root;
+}
+
+bool saveInteractiveRebase(git_repository* repository,
+                           const InteractiveRebaseState& state,
+                           QString* error)
+{
+    QSaveFile file(interactiveRebasePath(repository));
+    if (!file.open(QIODevice::WriteOnly)) {
+        if (error)
+            *error = QStringLiteral("Cannot save interactive rebase state: %1")
+                         .arg(file.errorString());
+        return false;
+    }
+    const QByteArray data = QJsonDocument(rebaseStateJson(state))
+                                .toJson(QJsonDocument::Compact);
+    if (file.write(data) != data.size()) {
+        if (error) {
+            *error = QStringLiteral("Cannot save interactive rebase state: %1")
+                         .arg(file.errorString());
+        }
+        file.cancelWriting();
+        return false;
+    }
+    if (!file.commit()) {
+        if (error)
+            *error = QStringLiteral("Cannot save interactive rebase state: %1")
+                         .arg(file.errorString());
+        return false;
+    }
+    return true;
+}
+
+bool loadInteractiveRebase(git_repository* repository,
+                           InteractiveRebaseState* state,
+                           QString* error)
+{
+    QFile file(interactiveRebasePath(repository));
+    if (!file.open(QIODevice::ReadOnly)) {
+        if (error)
+            *error = QStringLiteral("Cannot open interactive rebase state.");
+        return false;
+    }
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &parseError);
+    const QJsonObject root = document.object();
+    int version = -1;
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()
+        || !jsonInteger(root.value(QStringLiteral("version")), &version)
+        || version != 2
+        || !root.value(QStringLiteral("preview")).isObject()
+        || !root.value(QStringLiteral("items")).isArray()
+        || !root.value(QStringLiteral("pausedForEdit")).isBool()
+        || !root.value(QStringLiteral("preActionHead")).isString()
+        || !root.value(QStringLiteral("pendingTree")).isString()) {
+        if (error)
+            *error = QStringLiteral("Interactive rebase state is invalid.");
+        return false;
+    }
+
+    InteractiveRebaseState loaded;
+    if (!previewFromJson(root.value(QStringLiteral("preview")).toObject(),
+                         &loaded.plan.preview)
+        || loaded.plan.preview.dirty
+        || loaded.plan.preview.activeOperation != RepositoryOperation::None) {
+        if (error)
+            *error = QStringLiteral("Interactive rebase state is invalid.");
+        return false;
+    }
+
+    bool hasEffectiveCommit = false;
+    for (const QJsonValue& raw : root.value(QStringLiteral("items")).toArray()) {
+        if (!raw.isObject()) {
+            if (error)
+                *error = QStringLiteral("Interactive rebase state is invalid.");
+            return false;
+        }
+        const QJsonObject value = raw.toObject();
+        const QJsonValue hash = value.value(QStringLiteral("hash"));
+        const QJsonValue subject = value.value(QStringLiteral("subject"));
+        const QJsonValue message = value.value(QStringLiteral("message"));
+        const QJsonValue rewritten = value.value(QStringLiteral("rewrittenMessage"));
+        const QJsonValue published = value.value(QStringLiteral("published"));
+        if (!hash.isString() || !subject.isString() || !message.isString()
+            || !rewritten.isString() || !published.isBool()) {
+            if (error)
+                *error = QStringLiteral("Interactive rebase state is invalid.");
+            return false;
+        }
+        RebasePlanItem item;
+        item.hash = hash.toString();
+        item.subject = subject.toString();
+        item.message = message.toString();
+        const QJsonValue actionValue = value.value(QStringLiteral("action"));
+        int action = -1;
+        if (!jsonInteger(actionValue, &action)
+            || action < static_cast<int>(RebaseAction::Pick)
+            || action > static_cast<int>(RebaseAction::Drop)) {
+            if (error)
+                *error = QStringLiteral("Interactive rebase state contains an invalid action.");
+            return false;
+        }
+        item.action = static_cast<RebaseAction>(action);
+        item.rewrittenMessage = rewritten.toString();
+        item.published = published.toBool();
+        if (!jsonInteger(value.value(QStringLiteral("parentCount")),
+                         &item.parentCount)
+            || item.parentCount < 0 || item.parentCount > 1
+            || !validOidText(item.hash)) {
+            if (error)
+                *error = QStringLiteral("Interactive rebase state is invalid.");
+            return false;
+        }
+
+        if (!hasEffectiveCommit && item.action != RebaseAction::Drop) {
+            if (item.action == RebaseAction::Squash
+                || item.action == RebaseAction::Fixup) {
+                if (error) {
+                    *error = QStringLiteral(
+                        "Interactive rebase state starts with an invalid action.");
+                }
+                return false;
+            }
+            hasEffectiveCommit = true;
+        }
+        const QString effectiveMessage = item.rewrittenMessage.isEmpty()
+            ? item.message : item.rewrittenMessage;
+        if ((item.action == RebaseAction::Reword
+             || item.action == RebaseAction::Squash)
+            && effectiveMessage.trimmed().isEmpty()) {
+            if (error) {
+                *error = QStringLiteral(
+                    "Interactive rebase state contains an empty commit message.");
+            }
+            return false;
+        }
+        loaded.plan.items.append(item);
+    }
+
+    loaded.pausedForEdit =
+        root.value(QStringLiteral("pausedForEdit")).toBool();
+    loaded.preActionHead =
+        root.value(QStringLiteral("preActionHead")).toString();
+    loaded.pendingTree = root.value(QStringLiteral("pendingTree")).toString();
+    if (loaded.plan.items.isEmpty()
+        || !jsonInteger(root.value(QStringLiteral("completedIndex")),
+                        &loaded.completedIndex)
+        || !jsonInteger(root.value(QStringLiteral("pendingIndex")),
+                        &loaded.pendingIndex)
+        || loaded.completedIndex < -1
+        || loaded.completedIndex >= loaded.plan.items.size()
+        || loaded.pendingIndex < -1
+        || loaded.pendingIndex >= loaded.plan.items.size()) {
+        if (error)
+            *error = QStringLiteral("Interactive rebase state contains an invalid position.");
+        return false;
+    }
+
+    if (loaded.pendingIndex >= 0) {
+        const RebaseAction pendingAction =
+            loaded.plan.items.at(loaded.pendingIndex).action;
+        if (loaded.pausedForEdit
+            || (pendingAction != RebaseAction::Squash
+                && pendingAction != RebaseAction::Fixup)
+            || loaded.completedIndex != loaded.pendingIndex - 1
+            || !validOidText(loaded.preActionHead)
+            || !validOidText(loaded.pendingTree)) {
+            if (error)
+                *error = QStringLiteral("Interactive rebase pending state is invalid.");
+            return false;
+        }
+    } else if (!loaded.preActionHead.isEmpty()
+               || !loaded.pendingTree.isEmpty()) {
+        if (error)
+            *error = QStringLiteral("Interactive rebase pending state is invalid.");
+        return false;
+    }
+
+    if (loaded.pausedForEdit) {
+        const int editIndex = loaded.completedIndex + 1;
+        if (editIndex < 0 || editIndex >= loaded.plan.items.size()
+            || loaded.plan.items.at(editIndex).action != RebaseAction::Edit) {
+            if (error)
+                *error = QStringLiteral("Interactive rebase edit state is invalid.");
+            return false;
+        }
+    }
+
+    if (state)
+        *state = std::move(loaded);
+    return true;
+}
+
+bool removeInteractiveRebase(git_repository* repository, QString* error = nullptr)
+{
+    const QStringList paths = {
+        interactiveRebasePath(repository),
+        legacyInteractiveRebasePath(repository)
+    };
+    for (const QString& path : paths) {
+        if (path.isEmpty() || !QFileInfo::exists(path))
+            continue;
+        if (!QFile::remove(path)) {
+            if (error) {
+                *error = QStringLiteral(
+                    "Cannot remove stale interactive rebase state: %1")
+                             .arg(QDir::toNativeSeparators(path));
+            }
+            return false;
+        }
+    }
+    return true;
 }
 
 struct NetworkContext {
@@ -683,6 +1249,7 @@ RepositoryState LibGit2Backend::snapshot(QString* error) const
     result.rootPath = rootPath();
     result.detached = git_repository_head_detached(_repository) == 1;
     result.unborn = git_repository_head_unborn(_repository) == 1;
+    result.activeOperation = repositoryOperation(git_repository_state(_repository));
 
     ReferenceHandle head;
     const int headRc = git_repository_head(head.out(), _repository);
@@ -1340,9 +1907,607 @@ bool LibGit2Backend::commit(const QString& message, bool amend, bool signoff,
     return true;
 }
 
-bool LibGit2Backend::checkoutBranch(const QString& name, QString* error)
+HistoryRewritePreview LibGit2Backend::resetPreview(const QString& revision,
+                                                   QString* error) const
+{
+    HistoryRewritePreview preview;
+    preview.revision = revision.trimmed();
+    if (!ensureRepository(_repository, error))
+        return preview;
+
+    preview.activeOperation = repositoryOperation(git_repository_state(_repository));
+    if (!repositoryDirty(_repository, &preview.dirty, error))
+        return preview;
+
+    CommitHandle head;
+    CommitHandle target;
+    if (!lookupHeadCommit(_repository, head)) {
+        fail(error, QStringLiteral("Cannot prepare a history operation on an unborn HEAD."));
+        return preview;
+    }
+    if (!lookupCommit(_repository, preview.revision, target, error,
+                      QStringLiteral("Cannot resolve history operation target."))) {
+        return preview;
+    }
+
+    preview.expectedHead = oidText(git_commit_id(head.get()));
+    preview.targetHash = oidText(git_commit_id(target.get()));
+    if (!headDetails(_repository, nullptr, &preview.currentBranch,
+                     &preview.upstream, error)) {
+        return {};
+    }
+
+    QString affectedError;
+    const QVector<QString> affected = commitsBetween(
+        _repository, git_commit_id(head.get()), git_commit_id(target.get()),
+        &affectedError);
+    if (!affectedError.isEmpty()) {
+        if (error)
+            *error = affectedError;
+        return {};
+    }
+    preview.affectedCount = affected.size();
+
+    QString publishedError;
+    const QSet<QString> published = remoteReachableCommits(_repository,
+                                                           &publishedError);
+    if (!publishedError.isEmpty()) {
+        if (error)
+            *error = publishedError;
+        return {};
+    }
+    for (const QString& hash : affected) {
+        if (published.contains(hash))
+            ++preview.publishedCount;
+    }
+    return preview;
+}
+
+RebasePlan LibGit2Backend::rebasePlan(const QString& revision,
+                                      QString* error) const
+{
+    RebasePlan plan;
+    plan.preview = resetPreview(revision, error);
+    if (!ensureRepository(_repository, error)
+        || plan.preview.expectedHead.isEmpty()
+        || plan.preview.targetHash.isEmpty()) {
+        return plan;
+    }
+
+    CommitHandle head;
+    CommitHandle target;
+    if (!lookupHeadCommit(_repository, head)
+        || !lookupCommit(_repository, plan.preview.targetHash, target, error,
+                         QStringLiteral("Cannot resolve rebase target."))) {
+        if (error && error->isEmpty())
+            *error = QStringLiteral("Cannot resolve rebase revisions.");
+        return {};
+    }
+
+    QString rangeError;
+    const QVector<QString> range = commitsBetween(
+        _repository, git_commit_id(head.get()), git_commit_id(target.get()),
+        &rangeError);
+    if (!rangeError.isEmpty()) {
+        if (error)
+            *error = rangeError;
+        return {};
+    }
+    for (const QString& hash : range) {
+        CommitHandle commit;
+        if (!lookupCommit(_repository, hash, commit, error,
+                          QStringLiteral("Cannot inspect rebase commit."))) {
+            return {};
+        }
+        if (git_commit_parentcount(commit.get()) > 1) {
+            if (error) {
+                *error = QStringLiteral(
+                    "This rebase range contains merge commit %1; preserving merge topology is not supported yet.")
+                             .arg(hash.left(8));
+            }
+            return {};
+        }
+    }
+
+    AnnotatedHandle upstream;
+    if (git_annotated_commit_lookup(upstream.out(), _repository,
+                                    git_commit_id(target.get())) < 0) {
+        historyFailure(error, QStringLiteral("Cannot prepare rebase target."));
+        return {};
+    }
+    git_rebase_options options = GIT_REBASE_OPTIONS_INIT;
+    options.inmemory = 1;
+    RebaseHandle rebase;
+    if (git_rebase_init(rebase.out(), _repository, nullptr, upstream.get(),
+                        nullptr, &options) < 0) {
+        historyFailure(error, QStringLiteral("Cannot prepare rebase plan."));
+        return {};
+    }
+
+    QString publishedError;
+    const QSet<QString> published = remoteReachableCommits(_repository,
+                                                           &publishedError);
+    if (!publishedError.isEmpty()) {
+        if (error)
+            *error = publishedError;
+        return {};
+    }
+
+    const size_t count = git_rebase_operation_entrycount(rebase.get());
+    plan.items.reserve(static_cast<int>(count));
+    plan.preview.publishedCount = 0;
+    for (size_t index = 0; index < count; ++index) {
+        const git_rebase_operation* operation =
+            git_rebase_operation_byindex(rebase.get(), index);
+        if (!operation) {
+            if (error)
+                *error = QStringLiteral("Cannot inspect rebase operation.");
+            return {};
+        }
+        CommitHandle commit;
+        if (git_commit_lookup(commit.out(), _repository, &operation->id) < 0) {
+            historyFailure(error, QStringLiteral("Cannot inspect rebase commit."));
+            return {};
+        }
+        RebasePlanItem item;
+        item.hash = oidText(git_commit_id(commit.get()));
+        item.subject = text(git_commit_summary(commit.get()));
+        item.message = text(git_commit_message(commit.get()));
+        item.rewrittenMessage = item.message;
+        item.parentCount = static_cast<int>(git_commit_parentcount(commit.get()));
+        item.published = published.contains(item.hash);
+        if (item.published)
+            ++plan.preview.publishedCount;
+        plan.items.append(item);
+    }
+    plan.preview.affectedCount = plan.items.size();
+    return plan;
+}
+
+HistoryOperationResult LibGit2Backend::mergeRevision(const QString& revision,
+                                                     QString* error)
 {
     if (!ensureRepository(_repository, error))
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    if (!ensureHistoryOperationStart(_repository, {}, error))
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+
+    AnnotatedHandle target;
+    if (git_annotated_commit_from_revspec(target.out(), _repository,
+                                          revision.toUtf8().constData()) < 0) {
+        return historyFailure(error, QStringLiteral("Cannot resolve merge target."));
+    }
+    const git_annotated_commit* targets[] = {target.get()};
+    git_merge_analysis_t analysis = GIT_MERGE_ANALYSIS_NONE;
+    git_merge_preference_t preference = GIT_MERGE_PREFERENCE_NONE;
+    if (git_merge_analysis(&analysis, &preference, _repository, targets, 1) < 0)
+        return historyFailure(error, QStringLiteral("Cannot analyze merge."));
+
+    if (analysis & GIT_MERGE_ANALYSIS_UP_TO_DATE) {
+        return historyResult(HistoryOperationStatus::UpToDate,
+                             QStringLiteral("Already up to date."));
+    }
+
+    if ((analysis & (GIT_MERGE_ANALYSIS_FASTFORWARD
+                     | GIT_MERGE_ANALYSIS_UNBORN))
+        && !(preference & GIT_MERGE_PREFERENCE_NO_FASTFORWARD)) {
+        CommitHandle targetCommit;
+        if (git_commit_lookup(targetCommit.out(), _repository,
+                              git_annotated_commit_id(target.get())) < 0) {
+            return historyFailure(error,
+                                  QStringLiteral("Cannot resolve fast-forward target."));
+        }
+        ReferenceHandle head;
+        if (git_repository_head(head.out(), _repository) < 0) {
+            return historyFailure(error,
+                                  QStringLiteral("Cannot resolve HEAD for fast-forward."));
+        }
+        const char* headName = git_reference_name(head.get());
+        const git_oid* headOid = git_reference_target(head.get());
+        if (!headName || !headOid) {
+            if (error) {
+                *error = QStringLiteral(
+                    "Fast-forward merge requires a direct local branch HEAD.");
+            }
+            return historyResult(HistoryOperationStatus::Completed,
+                                 error ? *error : QString());
+        }
+
+        TransactionHandle transaction;
+        if (git_transaction_new(transaction.out(), _repository) < 0
+            || git_transaction_lock_ref(transaction.get(), headName) < 0) {
+            return historyFailure(
+                error,
+                QStringLiteral("Cannot lock the current branch for fast-forward."));
+        }
+
+        ReferenceHandle freshHead;
+        if (git_repository_head(freshHead.out(), _repository) < 0) {
+            return historyFailure(error,
+                                  QStringLiteral("Cannot re-check HEAD before fast-forward."));
+        }
+        const char* freshHeadName = git_reference_name(freshHead.get());
+        const git_oid* freshHeadOid = git_reference_target(freshHead.get());
+        if (!freshHeadName || !freshHeadOid
+            || std::strcmp(freshHeadName, headName) != 0
+            || git_oid_cmp(freshHeadOid, headOid) != 0) {
+            if (error) {
+                *error = QStringLiteral(
+                    "HEAD changed while preparing the fast-forward merge. Refresh and try again.");
+            }
+            return historyResult(HistoryOperationStatus::Completed,
+                                 error ? *error : QString());
+        }
+        if (git_transaction_set_target(transaction.get(), headName,
+                                       git_commit_id(targetCommit.get()),
+                                       nullptr, "merge: fast-forward") < 0) {
+            return historyFailure(
+                error,
+                QStringLiteral("Cannot queue the fast-forward branch update."));
+        }
+
+        CommitHandle originalCommit;
+        if (git_commit_lookup(originalCommit.out(), _repository, freshHeadOid) < 0) {
+            return historyFailure(error,
+                                  QStringLiteral("Cannot capture the current branch commit."));
+        }
+        TreeHandle originalTree;
+        if (git_commit_tree(originalTree.out(), originalCommit.get()) < 0) {
+            return historyFailure(error,
+                                  QStringLiteral("Cannot capture the current branch tree."));
+        }
+        git_checkout_options checkout = GIT_CHECKOUT_OPTIONS_INIT;
+        checkout.checkout_strategy = GIT_CHECKOUT_SAFE
+                                   | GIT_CHECKOUT_RECREATE_MISSING;
+        if (git_checkout_tree(_repository,
+                              reinterpret_cast<git_object*>(targetCommit.get()),
+                              &checkout) < 0) {
+            return historyFailure(error,
+                                  QStringLiteral("Cannot check out fast-forward target."));
+        }
+
+        if (git_transaction_commit(transaction.get()) < 0) {
+            git_checkout_options rollback = GIT_CHECKOUT_OPTIONS_INIT;
+            rollback.checkout_strategy = GIT_CHECKOUT_FORCE
+                                       | GIT_CHECKOUT_RECREATE_MISSING;
+            git_checkout_tree(_repository,
+                              reinterpret_cast<git_object*>(originalTree.get()),
+                              &rollback);
+            git_reset(_repository,
+                      reinterpret_cast<git_object*>(originalCommit.get()),
+                      GIT_RESET_MIXED, nullptr);
+            return historyFailure(
+                error,
+                QStringLiteral("Cannot update the current branch after fast-forward."));
+        }
+        progress(QStringLiteral("Fast-forward merge completed"), 100);
+        return historyResult(HistoryOperationStatus::Completed,
+                             QStringLiteral("Fast-forward completed."));
+    }
+
+    const bool forceMergeCommit =
+        (analysis & GIT_MERGE_ANALYSIS_FASTFORWARD)
+        && (preference & GIT_MERGE_PREFERENCE_NO_FASTFORWARD);
+    if (!(analysis & GIT_MERGE_ANALYSIS_NORMAL) && !forceMergeCommit) {
+        if (error)
+            *error = QStringLiteral("No supported merge is available.");
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+    if (preference & GIT_MERGE_PREFERENCE_FASTFORWARD_ONLY) {
+        if (error)
+            *error = QStringLiteral("The repository is configured for fast-forward-only merges.");
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+
+    git_merge_options mergeOptions = GIT_MERGE_OPTIONS_INIT;
+    git_checkout_options checkout = GIT_CHECKOUT_OPTIONS_INIT;
+    checkout.checkout_strategy = GIT_CHECKOUT_SAFE
+                               | GIT_CHECKOUT_RECREATE_MISSING
+                               | GIT_CHECKOUT_ALLOW_CONFLICTS;
+    if (git_merge(_repository, targets, 1, &mergeOptions, &checkout) < 0)
+        return historyFailure(error, QStringLiteral("Cannot merge revision."));
+
+    IndexHandle index;
+    if (git_repository_index(index.out(), _repository) < 0)
+        return historyFailure(error, QStringLiteral("Cannot open merge index."));
+    if (git_index_has_conflicts(index.get())) {
+        return historyResult(HistoryOperationStatus::Conflicts,
+                             QStringLiteral("Merge stopped because of conflicts."));
+    }
+    if (!createStateCommit(QStringLiteral("merge"), error))
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    progress(QStringLiteral("Merge completed"), 100);
+    return historyResult(HistoryOperationStatus::Completed,
+                         QStringLiteral("Merge completed."));
+}
+
+HistoryOperationResult LibGit2Backend::rebaseOnto(const RebasePlan& requestedPlan,
+                                                  bool interactive,
+                                                  QString* error)
+{
+    if (!ensureRepository(_repository, error))
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    if (requestedPlan.preview.expectedHead.isEmpty()
+        || requestedPlan.preview.targetHash.isEmpty()) {
+        if (error)
+            *error = QStringLiteral("The rebase plan is incomplete.");
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+    if (!ensureHistoryOperationStart(_repository,
+                                     requestedPlan.preview.expectedHead, error)) {
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+    QString currentBranch;
+    if (!headDetails(_repository, nullptr, &currentBranch, nullptr, error)) {
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+    if (currentBranch != requestedPlan.preview.currentBranch) {
+        if (error) {
+            *error = QStringLiteral(
+                "The current branch changed after the rebase plan was prepared. Refresh and try again.");
+        }
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+
+    CommitHandle resolvedTarget;
+    const QString targetRevision = requestedPlan.preview.revision.isEmpty()
+        ? requestedPlan.preview.targetHash : requestedPlan.preview.revision;
+    if (!lookupCommit(_repository, targetRevision, resolvedTarget, error,
+                      QStringLiteral("Cannot resolve rebase target."))) {
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+    if (oidText(git_commit_id(resolvedTarget.get())).compare(
+            requestedPlan.preview.targetHash, Qt::CaseInsensitive) != 0) {
+        if (error)
+            *error = QStringLiteral("The rebase target changed after the plan was prepared.");
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+
+    QString planError;
+    RebasePlan effective = rebasePlan(requestedPlan.preview.targetHash, &planError);
+    if (!planError.isEmpty()) {
+        if (error)
+            *error = planError;
+        return historyResult(HistoryOperationStatus::Completed, planError);
+    }
+    if (effective.preview.expectedHead.compare(
+            requestedPlan.preview.expectedHead, Qt::CaseInsensitive) != 0
+        || effective.preview.currentBranch != requestedPlan.preview.currentBranch
+        || effective.items.size() != requestedPlan.items.size()) {
+        if (error)
+            *error = QStringLiteral("The rebase plan is stale. Refresh and prepare it again.");
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+    bool hasEffectiveCommit = false;
+    for (int index = 0; index < effective.items.size(); ++index) {
+        if (effective.items[index].hash.compare(requestedPlan.items[index].hash,
+                                                Qt::CaseInsensitive) != 0) {
+            if (error)
+                *error = QStringLiteral("The rebase plan order is invalid.");
+            return historyResult(HistoryOperationStatus::Completed,
+                                 error ? *error : QString());
+        }
+        const RebaseAction action = interactive
+            ? requestedPlan.items[index].action : RebaseAction::Pick;
+        if (static_cast<int>(action) < static_cast<int>(RebaseAction::Pick)
+            || static_cast<int>(action) > static_cast<int>(RebaseAction::Drop)) {
+            if (error)
+                *error = QStringLiteral("The rebase plan contains an invalid action.");
+            return historyResult(HistoryOperationStatus::Completed,
+                                 error ? *error : QString());
+        }
+        if (!hasEffectiveCommit && action != RebaseAction::Drop) {
+            if (action == RebaseAction::Squash || action == RebaseAction::Fixup) {
+                if (error) {
+                    *error = QStringLiteral(
+                        "The first non-dropped rebase item cannot be squash or fixup.");
+                }
+                return historyResult(HistoryOperationStatus::Completed,
+                                     error ? *error : QString());
+            }
+            hasEffectiveCommit = true;
+        }
+        const QString requestedMessage =
+            requestedPlan.items[index].rewrittenMessage.isEmpty()
+                ? requestedPlan.items[index].message
+                : requestedPlan.items[index].rewrittenMessage;
+        if ((action == RebaseAction::Reword
+             || action == RebaseAction::Squash)
+            && requestedMessage.trimmed().isEmpty()) {
+            if (error)
+                *error = QStringLiteral(
+                    "Reword and squash actions require a commit message.");
+            return historyResult(HistoryOperationStatus::Completed,
+                                 error ? *error : QString());
+        }
+        effective.items[index].action = action;
+        effective.items[index].rewrittenMessage =
+            requestedPlan.items[index].rewrittenMessage;
+    }
+    if (effective.items.isEmpty()) {
+        return historyResult(HistoryOperationStatus::UpToDate,
+                             QStringLiteral("No commits need to be rebased."));
+    }
+    if (!removeInteractiveRebase(_repository, error)) {
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+
+    AnnotatedHandle upstream;
+    if (git_annotated_commit_lookup(upstream.out(), _repository,
+                                    git_commit_id(resolvedTarget.get())) < 0) {
+        return historyFailure(error, QStringLiteral("Cannot prepare rebase target."));
+    }
+    git_rebase_options options = GIT_REBASE_OPTIONS_INIT;
+    options.checkout_options.checkout_strategy = GIT_CHECKOUT_SAFE
+                                               | GIT_CHECKOUT_RECREATE_MISSING;
+    RebaseHandle rebase;
+    if (git_rebase_init(rebase.out(), _repository, nullptr, upstream.get(),
+                        nullptr, &options) < 0) {
+        return historyFailure(error, QStringLiteral("Cannot start rebase."));
+    }
+
+    if (!interactive)
+        return finishRebaseResult(rebase.get(), error);
+    InteractiveRebaseState state;
+    state.plan = effective;
+    if (!saveInteractiveRebase(_repository, state, error)) {
+        git_rebase_abort(rebase.get());
+        QString cleanupError;
+        removeInteractiveRebase(_repository, &cleanupError);
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+    return finishInteractiveRebase(rebase.get(), std::move(state), error);
+}
+
+HistoryOperationResult LibGit2Backend::cherryPickCommit(const QString& revision,
+                                                        unsigned int mainline,
+                                                        QString* error)
+{
+    if (!ensureRepository(_repository, error)
+        || !ensureHistoryOperationStart(_repository, {}, error)) {
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+    CommitHandle commit;
+    if (!lookupCommit(_repository, revision, commit, error,
+                      QStringLiteral("Cannot resolve cherry-pick commit."))) {
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+    git_cherrypick_options options = GIT_CHERRYPICK_OPTIONS_INIT;
+    options.mainline = mainline;
+    options.checkout_opts.checkout_strategy = GIT_CHECKOUT_SAFE
+                                             | GIT_CHECKOUT_RECREATE_MISSING
+                                             | GIT_CHECKOUT_ALLOW_CONFLICTS;
+    if (git_cherrypick(_repository, commit.get(), &options) < 0)
+        return historyFailure(error, QStringLiteral("Cannot cherry-pick commit."));
+
+    IndexHandle index;
+    if (git_repository_index(index.out(), _repository) < 0)
+        return historyFailure(error, QStringLiteral("Cannot open cherry-pick index."));
+    if (git_index_has_conflicts(index.get())) {
+        return historyResult(HistoryOperationStatus::Conflicts,
+                             QStringLiteral("Cherry-pick stopped because of conflicts."));
+    }
+    if (!createStateCommit(QStringLiteral("cherry-pick"), error))
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    return historyResult(HistoryOperationStatus::Completed,
+                         QStringLiteral("Cherry-pick completed."));
+}
+
+HistoryOperationResult LibGit2Backend::revertCommit(const QString& revision,
+                                                    unsigned int mainline,
+                                                    QString* error)
+{
+    if (!ensureRepository(_repository, error)
+        || !ensureHistoryOperationStart(_repository, {}, error)) {
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+    CommitHandle commit;
+    if (!lookupCommit(_repository, revision, commit, error,
+                      QStringLiteral("Cannot resolve revert commit."))) {
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+    git_revert_options options = GIT_REVERT_OPTIONS_INIT;
+    options.mainline = mainline;
+    options.checkout_opts.checkout_strategy = GIT_CHECKOUT_SAFE
+                                             | GIT_CHECKOUT_RECREATE_MISSING
+                                             | GIT_CHECKOUT_ALLOW_CONFLICTS;
+    if (git_revert(_repository, commit.get(), &options) < 0)
+        return historyFailure(error, QStringLiteral("Cannot revert commit."));
+
+    IndexHandle index;
+    if (git_repository_index(index.out(), _repository) < 0)
+        return historyFailure(error, QStringLiteral("Cannot open revert index."));
+    if (git_index_has_conflicts(index.get())) {
+        return historyResult(HistoryOperationStatus::Conflicts,
+                             QStringLiteral("Revert stopped because of conflicts."));
+    }
+    if (!createStateCommit(QStringLiteral("revert"), error))
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    return historyResult(HistoryOperationStatus::Completed,
+                         QStringLiteral("Revert completed."));
+}
+
+HistoryOperationResult LibGit2Backend::resetToCommit(
+    const HistoryRewritePreview& preview, ResetMode mode, QString* error)
+{
+    if (!ensureRepository(_repository, error))
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    if (git_repository_state(_repository) != GIT_REPOSITORY_STATE_NONE) {
+        if (error)
+            *error = QStringLiteral("Abort or finish the active repository operation first.");
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+    QString currentHead;
+    QString currentBranch;
+    if (!headDetails(_repository, &currentHead, &currentBranch, nullptr, error))
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    if (preview.expectedHead.isEmpty()
+        || currentHead.compare(preview.expectedHead, Qt::CaseInsensitive) != 0) {
+        if (error)
+            *error = QStringLiteral("HEAD changed after reset was previewed. Refresh and try again.");
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+    if (currentBranch != preview.currentBranch) {
+        if (error) {
+            *error = QStringLiteral(
+                "The current branch changed after reset was previewed. Refresh and try again.");
+        }
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+
+    CommitHandle target;
+    if (!lookupCommit(_repository, preview.targetHash, target, error,
+                      QStringLiteral("Cannot resolve reset target."))) {
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+    git_reset_t resetType = GIT_RESET_MIXED;
+    switch (mode) {
+    case ResetMode::Soft:  resetType = GIT_RESET_SOFT; break;
+    case ResetMode::Mixed: resetType = GIT_RESET_MIXED; break;
+    case ResetMode::Hard:  resetType = GIT_RESET_HARD; break;
+    }
+    git_checkout_options checkout = GIT_CHECKOUT_OPTIONS_INIT;
+    checkout.checkout_strategy = GIT_CHECKOUT_FORCE
+                               | GIT_CHECKOUT_RECREATE_MISSING;
+    if (git_reset(_repository, reinterpret_cast<git_object*>(target.get()),
+                  resetType, &checkout) < 0) {
+        return historyFailure(error, QStringLiteral("Cannot reset HEAD."));
+    }
+    return historyResult(HistoryOperationStatus::Completed,
+                         QStringLiteral("Reset completed."));
+}
+
+bool LibGit2Backend::checkoutBranch(const QString& name, QString* error)
+{
+    if (!ensureRepository(_repository, error)
+        || !ensureNoActiveOperation(_repository, error))
         return false;
     QByteArray branchName = name.toUtf8();
     ReferenceHandle branch;
@@ -1397,7 +2562,8 @@ bool LibGit2Backend::checkoutBranch(const QString& name, QString* error)
 bool LibGit2Backend::createBranch(const QString& name, const QString& from,
                                   QString* error)
 {
-    if (!ensureRepository(_repository, error))
+    if (!ensureRepository(_repository, error)
+        || !ensureNoActiveOperation(_repository, error))
         return false;
     CommitHandle target;
     const QString revision = from.isEmpty() ? QStringLiteral("HEAD") : from;
@@ -1429,7 +2595,8 @@ bool LibGit2Backend::createBranch(const QString& name, const QString& from,
 bool LibGit2Backend::deleteBranch(const QString& name, bool force,
                                   QString* error)
 {
-    if (!ensureRepository(_repository, error))
+    if (!ensureRepository(_repository, error)
+        || !ensureNoActiveOperation(_repository, error))
         return false;
     const QByteArray branchName = name.toUtf8();
     ReferenceHandle branch;
@@ -1467,7 +2634,8 @@ bool LibGit2Backend::deleteBranch(const QString& name, bool force,
 bool LibGit2Backend::createTag(const QString& name, const QString& target,
                                const QString& message, QString* error)
 {
-    if (!ensureRepository(_repository, error))
+    if (!ensureRepository(_repository, error)
+        || !ensureNoActiveOperation(_repository, error))
         return false;
     const QByteArray revision = (target.isEmpty() ? QStringLiteral("HEAD")
                                                    : target).toUtf8();
@@ -1496,7 +2664,8 @@ bool LibGit2Backend::createTag(const QString& name, const QString& target,
 
 bool LibGit2Backend::deleteTag(const QString& name, QString* error)
 {
-    if (!ensureRepository(_repository, error))
+    if (!ensureRepository(_repository, error)
+        || !ensureNoActiveOperation(_repository, error))
         return false;
     if (git_tag_delete(_repository, name.toUtf8().constData()) < 0)
         return fail(error, QStringLiteral("Cannot delete tag."));
@@ -1877,11 +3046,12 @@ bool LibGit2Backend::resolveConflict(const QString& path, bool ours,
     return true;
 }
 
-bool LibGit2Backend::continueOperation(const QString& operation,
-                                       QString* error)
+HistoryOperationResult LibGit2Backend::continueHistoryOperation(
+    const QString& operation, QString* error)
 {
     if (!ensureRepository(_repository, error))
-        return false;
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
     const QString name = operation.trimmed().toLower();
     const int state = git_repository_state(_repository);
     if (name == QStringLiteral("rebase")) {
@@ -1890,31 +3060,81 @@ bool LibGit2Backend::continueOperation(const QString& operation,
             && state != GIT_REPOSITORY_STATE_REBASE_MERGE) {
             if (error)
                 *error = QStringLiteral("No matching rebase is in progress.");
-            return false;
+            return historyResult(HistoryOperationStatus::Completed,
+                                 error ? *error : QString());
         }
         RebaseHandle rebase;
         git_rebase_options options = GIT_REBASE_OPTIONS_INIT;
         options.checkout_options.checkout_strategy = GIT_CHECKOUT_SAFE
                                                    | GIT_CHECKOUT_RECREATE_MISSING;
         if (git_rebase_open(rebase.out(), _repository, &options) < 0)
-            return fail(error, QStringLiteral("No rebase is in progress."));
-        return finishRebase(rebase.get(), error);
+            return historyFailure(error, QStringLiteral("No supported rebase is in progress."));
+
+        const QString sidecar = interactiveRebasePath(_repository);
+        if (!sidecar.isEmpty() && QFileInfo::exists(sidecar)) {
+            InteractiveRebaseState interactiveState;
+            if (!loadInteractiveRebase(_repository, &interactiveState,
+                                       error)) {
+                return historyResult(HistoryOperationStatus::Completed,
+                                     error ? *error : QString());
+            }
+            return finishInteractiveRebase(rebase.get(),
+                                           std::move(interactiveState), error);
+        }
+        return finishRebaseResult(rebase.get(), error);
     }
     const bool matchesMerge = name == QStringLiteral("merge")
         && state == GIT_REPOSITORY_STATE_MERGE;
+    if (state == GIT_REPOSITORY_STATE_CHERRYPICK_SEQUENCE
+        || state == GIT_REPOSITORY_STATE_REVERT_SEQUENCE) {
+        if (error) {
+            *error = QStringLiteral(
+                "Multi-commit cherry-pick/revert sequences are not supported; use the tool that started the sequence.");
+        }
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
     const bool matchesCherryPick = (name == QStringLiteral("cherry-pick")
                                     || name == QStringLiteral("cherrypick"))
-        && (state == GIT_REPOSITORY_STATE_CHERRYPICK
-            || state == GIT_REPOSITORY_STATE_CHERRYPICK_SEQUENCE);
+        && state == GIT_REPOSITORY_STATE_CHERRYPICK;
     const bool matchesRevert = name == QStringLiteral("revert")
-        && (state == GIT_REPOSITORY_STATE_REVERT
-            || state == GIT_REPOSITORY_STATE_REVERT_SEQUENCE);
-    if (matchesMerge || matchesCherryPick || matchesRevert)
-        return createStateCommit(name, error);
+        && state == GIT_REPOSITORY_STATE_REVERT;
+    if (matchesMerge || matchesCherryPick || matchesRevert) {
+        IndexHandle index;
+        if (git_repository_index(index.out(), _repository) < 0)
+            return historyFailure(error, QStringLiteral("Cannot open operation index."));
+        if (git_index_has_conflicts(index.get())) {
+            return historyResult(HistoryOperationStatus::Conflicts,
+                                 QStringLiteral("Resolve all conflicts before continuing."));
+        }
+        if (!createStateCommit(name, error)) {
+            return historyResult(HistoryOperationStatus::Completed,
+                                 error ? *error : QString());
+        }
+        return historyResult(HistoryOperationStatus::Completed,
+                             QStringLiteral("Operation completed."));
+    }
 
     if (error)
         *error = QStringLiteral("No matching operation is in progress.");
-    return false;
+    return historyResult(HistoryOperationStatus::Completed,
+                         error ? *error : QString());
+}
+
+bool LibGit2Backend::continueOperation(const QString& operation,
+                                       QString* error)
+{
+    const HistoryOperationResult result = continueHistoryOperation(operation,
+                                                                   error);
+    if (error && !error->isEmpty())
+        return false;
+    if (result.status == HistoryOperationStatus::Conflicts
+        || result.status == HistoryOperationStatus::PausedForEdit) {
+        if (error)
+            *error = result.message;
+        return false;
+    }
+    return true;
 }
 
 bool LibGit2Backend::abortOperation(const QString& operation, QString* error)
@@ -1938,19 +3158,25 @@ bool LibGit2Backend::abortOperation(const QString& operation, QString* error)
             return fail(error, QStringLiteral("No rebase is in progress."));
         if (git_rebase_abort(rebase.get()) < 0)
             return fail(error, QStringLiteral("Cannot abort rebase."));
-        return true;
+        return removeInteractiveRebase(_repository, error);
     }
 
     const int state = git_repository_state(_repository);
+    if (state == GIT_REPOSITORY_STATE_CHERRYPICK_SEQUENCE
+        || state == GIT_REPOSITORY_STATE_REVERT_SEQUENCE) {
+        if (error) {
+            *error = QStringLiteral(
+                "Multi-commit cherry-pick/revert sequences are not supported; use the tool that started the sequence.");
+        }
+        return false;
+    }
     const bool matchesMerge = name == QStringLiteral("merge")
         && state == GIT_REPOSITORY_STATE_MERGE;
     const bool matchesCherryPick = (name == QStringLiteral("cherry-pick")
                                     || name == QStringLiteral("cherrypick"))
-        && (state == GIT_REPOSITORY_STATE_CHERRYPICK
-            || state == GIT_REPOSITORY_STATE_CHERRYPICK_SEQUENCE);
+        && state == GIT_REPOSITORY_STATE_CHERRYPICK;
     const bool matchesRevert = name == QStringLiteral("revert")
-        && (state == GIT_REPOSITORY_STATE_REVERT
-            || state == GIT_REPOSITORY_STATE_REVERT_SEQUENCE);
+        && state == GIT_REPOSITORY_STATE_REVERT;
     if (!matchesMerge && !matchesCherryPick && !matchesRevert) {
         if (error)
             *error = QStringLiteral("No matching operation is in progress.");
@@ -1970,26 +3196,43 @@ bool LibGit2Backend::abortOperation(const QString& operation, QString* error)
 
 bool LibGit2Backend::finishRebase(git_rebase* rebase, QString* error)
 {
+    const HistoryOperationResult result = finishRebaseResult(rebase, error);
+    if (error && !error->isEmpty())
+        return false;
+    if (result.status == HistoryOperationStatus::Conflicts
+        || result.status == HistoryOperationStatus::PausedForEdit) {
+        if (error)
+            *error = result.message;
+        return false;
+    }
+    return true;
+}
+
+HistoryOperationResult LibGit2Backend::finishRebaseResult(git_rebase* rebase,
+                                                          QString* error)
+{
     SignatureHandle signature;
     if (git_signature_default(signature.out(), _repository) < 0)
-        return fail(error, QStringLiteral("Git user.name and user.email are required."));
+        return historyFailure(error,
+                              QStringLiteral("Git user.name and user.email are required."));
 
     const size_t total = git_rebase_operation_entrycount(rebase);
     size_t current = git_rebase_operation_current(rebase);
     if (current != GIT_REBASE_NO_OPERATION) {
         IndexHandle index;
         if (git_repository_index(index.out(), _repository) < 0)
-            return fail(error, QStringLiteral("Cannot open rebase index."));
+            return historyFailure(error, QStringLiteral("Cannot open rebase index."));
         if (git_index_has_conflicts(index.get())) {
-            if (error)
-                *error = QStringLiteral("Resolve all conflicts before continuing rebase.");
-            return false;
+            return historyResult(
+                HistoryOperationStatus::Conflicts,
+                QStringLiteral("Resolve all conflicts before continuing rebase."));
         }
         git_oid commitOid;
         const int commitRc = git_rebase_commit(&commitOid, rebase, nullptr,
                                                 signature.get(), nullptr, nullptr);
         if (commitRc < 0 && commitRc != GIT_EAPPLIED)
-            return fail(error, QStringLiteral("Cannot commit resolved rebase step."));
+            return historyFailure(error,
+                                  QStringLiteral("Cannot commit resolved rebase step."));
         git_error_clear();
     }
 
@@ -1997,19 +3240,20 @@ bool LibGit2Backend::finishRebase(git_rebase* rebase, QString* error)
         if (isCancelled()) {
             if (error)
                 *error = QStringLiteral("Operation cancelled; rebase remains in progress.");
-            return false;
+            return historyResult(HistoryOperationStatus::Completed,
+                                 error ? *error : QString());
         }
         git_rebase_operation* rebaseOperation = nullptr;
         const int nextRc = git_rebase_next(&rebaseOperation, rebase);
         if (nextRc == GIT_ITEROVER)
             break;
         if (nextRc == GIT_EMERGECONFLICT) {
-            if (error)
-                *error = QStringLiteral("Rebase stopped because of conflicts.");
-            return false;
+            return historyResult(HistoryOperationStatus::Conflicts,
+                                 QStringLiteral("Rebase stopped because of conflicts."));
         }
         if (nextRc < 0)
-            return fail(error, QStringLiteral("Cannot apply next rebase step."));
+            return historyFailure(error,
+                                  QStringLiteral("Cannot apply next rebase step."));
 
         current = git_rebase_operation_current(rebase);
         progress(QStringLiteral("Rebasing %1/%2")
@@ -2018,24 +3262,591 @@ bool LibGit2Backend::finishRebase(git_rebase* rebase, QString* error)
 
         IndexHandle index;
         if (git_repository_index(index.out(), _repository) < 0)
-            return fail(error, QStringLiteral("Cannot open rebase index."));
+            return historyFailure(error, QStringLiteral("Cannot open rebase index."));
         if (git_index_has_conflicts(index.get())) {
-            if (error)
-                *error = QStringLiteral("Rebase stopped because of conflicts.");
-            return false;
+            return historyResult(HistoryOperationStatus::Conflicts,
+                                 QStringLiteral("Rebase stopped because of conflicts."));
         }
 
         git_oid commitOid;
         const int commitRc = git_rebase_commit(&commitOid, rebase, nullptr,
                                                 signature.get(), nullptr, nullptr);
         if (commitRc < 0 && commitRc != GIT_EAPPLIED)
-            return fail(error, QStringLiteral("Cannot commit rebase step."));
+            return historyFailure(error, QStringLiteral("Cannot commit rebase step."));
         git_error_clear();
     }
     if (git_rebase_finish(rebase, signature.get()) < 0)
-        return fail(error, QStringLiteral("Cannot finish rebase."));
+        return historyFailure(error, QStringLiteral("Cannot finish rebase."));
     progress(QStringLiteral("Rebase completed"), 100);
-    return true;
+    return historyResult(total == 0 ? HistoryOperationStatus::UpToDate
+                                    : HistoryOperationStatus::Completed,
+                         total == 0 ? QStringLiteral("No commits needed rebasing.")
+                                    : QStringLiteral("Rebase completed."));
+}
+
+HistoryOperationResult LibGit2Backend::finishInteractiveRebase(
+    git_rebase* rebase, InteractiveRebaseState state, QString* error)
+{
+    RebasePlan& plan = state.plan;
+    bool& pausedForEdit = state.pausedForEdit;
+    int& completedIndex = state.completedIndex;
+    const QString originalHead = oidText(git_rebase_orig_head_id(rebase));
+    const QString onto = oidText(git_rebase_onto_id(rebase));
+    if (originalHead.compare(plan.preview.expectedHead,
+                             Qt::CaseInsensitive) != 0
+        || onto.compare(plan.preview.targetHash, Qt::CaseInsensitive) != 0) {
+        if (error) {
+            *error = QStringLiteral(
+                "Interactive rebase state belongs to a different rebase session.");
+        }
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+
+    SignatureHandle signature;
+    if (git_signature_default(signature.out(), _repository) < 0) {
+        return historyFailure(
+            error, QStringLiteral("Git user.name and user.email are required."));
+    }
+
+    const size_t total = git_rebase_operation_entrycount(rebase);
+    if (total != static_cast<size_t>(plan.items.size())) {
+        if (error)
+            *error = QStringLiteral("Interactive rebase state does not match the repository.");
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+    for (size_t index = 0; index < total; ++index) {
+        const git_rebase_operation* operation =
+            git_rebase_operation_byindex(rebase, index);
+        if (!operation
+            || oidText(&operation->id).compare(plan.items.at(static_cast<int>(index)).hash,
+                                               Qt::CaseInsensitive) != 0) {
+            if (error) {
+                *error = QStringLiteral(
+                    "Interactive rebase commit order does not match the saved plan.");
+            }
+            return historyResult(HistoryOperationStatus::Completed,
+                                 error ? *error : QString());
+        }
+    }
+
+    auto restoreHeadTree = [this, error]() -> bool {
+        CommitHandle head;
+        TreeHandle tree;
+        IndexHandle index;
+        if (!lookupHeadCommit(_repository, head)
+            || git_commit_tree(tree.out(), head.get()) < 0
+            || git_repository_index(index.out(), _repository) < 0) {
+            return fail(error, QStringLiteral("Cannot restore HEAD while dropping a commit."));
+        }
+        git_checkout_options checkout = GIT_CHECKOUT_OPTIONS_INIT;
+        checkout.checkout_strategy = GIT_CHECKOUT_FORCE
+                                   | GIT_CHECKOUT_RECREATE_MISSING;
+        if (git_checkout_tree(_repository,
+                              reinterpret_cast<git_object*>(head.get()),
+                              &checkout) < 0
+            || git_index_read_tree(index.get(), tree.get()) < 0
+            || git_index_write(index.get()) < 0) {
+            return fail(error, QStringLiteral("Cannot drop rebase commit."));
+        }
+        return true;
+    };
+
+    auto updateRewrittenMapping = [this, error](const QString& source,
+                                                const QString& oldTarget,
+                                                const QString& newTarget)
+        -> bool {
+        const char* gitDir = git_repository_path(_repository);
+        if (!gitDir) {
+            if (error)
+                *error = QStringLiteral("Cannot locate interactive rebase state.");
+            return false;
+        }
+        const QString path = QDir(QString::fromUtf8(gitDir))
+            .filePath(QStringLiteral("rebase-merge/rewritten"));
+        const QString backupPath = QDir(QString::fromUtf8(gitDir))
+            .filePath(QStringLiteral("rebase-merge/gitmanager-rewritten"));
+        QStringList lines;
+        auto readMappings = [](const QString& filePath,
+                               QStringList* mappings) {
+            QFile input(filePath);
+            if (!input.open(QIODevice::ReadOnly))
+                return false;
+            const QStringList candidate = QString::fromUtf8(input.readAll())
+                .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+            for (const QString& line : candidate) {
+                const int separator = line.indexOf(QLatin1Char(' '));
+                if (separator <= 0
+                    || !validOidText(line.left(separator))
+                    || !validOidText(line.mid(separator + 1).trimmed())) {
+                    return false;
+                }
+            }
+            if (mappings)
+                *mappings = candidate;
+            return true;
+        };
+        auto containsMapping = [](const QStringList& mappings,
+                                  const QString& from,
+                                  const QString& to) {
+            for (const QString& line : mappings) {
+                const int separator = line.indexOf(QLatin1Char(' '));
+                if (line.left(separator).compare(from, Qt::CaseInsensitive) == 0
+                    && line.mid(separator + 1).trimmed().compare(
+                           to, Qt::CaseInsensitive) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        auto containsTarget = [](const QStringList& mappings,
+                                 const QString& target) {
+            for (const QString& line : mappings) {
+                const int separator = line.indexOf(QLatin1Char(' '));
+                if (line.mid(separator + 1).trimmed().compare(
+                        target, Qt::CaseInsensitive) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        const bool mappingExists = QFileInfo::exists(path);
+        const bool backupExists = QFileInfo::exists(backupPath);
+        QStringList primaryLines;
+        QStringList backupLines;
+        const bool primaryValid = mappingExists
+            && readMappings(path, &primaryLines);
+        const bool backupValid = backupExists
+            && readMappings(backupPath, &backupLines);
+
+        // The backup is committed before the libgit2-owned file is replaced.
+        // Seeing the current post-action mapping in it therefore identifies a
+        // complete retry state, even if the primary file contains a valid but
+        // truncated prefix from an interrupted write.
+        if (backupValid && containsMapping(backupLines, source, newTarget)) {
+            lines = backupLines;
+        } else if (primaryValid
+                   && (containsMapping(primaryLines, source, newTarget)
+                       || containsTarget(primaryLines, oldTarget))) {
+            lines = primaryLines;
+        } else {
+            if (error)
+                *error = QStringLiteral("Cannot recover rewritten commit mapping.");
+            return false;
+        }
+        bool sourcePresent = false;
+        for (QString& line : lines) {
+            const int separator = line.indexOf(QLatin1Char(' '));
+            const QString from = line.left(separator);
+            QString to = line.mid(separator + 1).trimmed();
+            if (to.compare(oldTarget, Qt::CaseInsensitive) == 0)
+                to = newTarget;
+            if (from.compare(source, Qt::CaseInsensitive) == 0) {
+                to = newTarget;
+                sourcePresent = true;
+            }
+            line = from + QLatin1Char(' ') + to;
+        }
+        if (!sourcePresent)
+            lines.append(source + QLatin1Char(' ') + newTarget);
+        if (!containsMapping(lines, source, newTarget)
+            || (oldTarget.compare(newTarget, Qt::CaseInsensitive) != 0
+                && containsTarget(lines, oldTarget))) {
+            if (error)
+                *error = QStringLiteral("Cannot safely update rewritten commit mapping.");
+            return false;
+        }
+        QByteArray data = lines.join(QLatin1Char('\n')).toUtf8();
+        data.append('\n');
+
+        QSaveFile backup(backupPath);
+        if (!backup.open(QIODevice::WriteOnly)
+            || backup.write(data) != data.size()
+            || !backup.commit()) {
+            if (error) {
+                *error = QStringLiteral("Cannot back up rewritten commit mapping: %1")
+                             .arg(backup.errorString());
+            }
+            return false;
+        }
+
+        QSaveFile output(path);
+        if (!output.open(QIODevice::WriteOnly | QIODevice::Truncate)
+            || output.write(data) != data.size() || !output.commit()) {
+            if (error) {
+                *error = QStringLiteral("Cannot save rewritten commit mapping: %1")
+                             .arg(output.errorString());
+            }
+            return false;
+        }
+        return true;
+    };
+
+    auto combinedMessage = [](git_commit* previous,
+                              const RebasePlanItem& item) {
+        QString message = text(git_commit_message(previous));
+        if (item.action == RebaseAction::Squash) {
+            QString incoming = item.rewrittenMessage.isEmpty()
+                ? item.message : item.rewrittenMessage;
+            while (message.endsWith(QLatin1Char('\n')))
+                message.chop(1);
+            incoming = incoming.trimmed();
+            if (!incoming.isEmpty())
+                message += QStringLiteral("\n\n") + incoming;
+        }
+        return message;
+    };
+
+    auto sameParents = [](git_commit* left, git_commit* right) {
+        const size_t count = git_commit_parentcount(left);
+        if (count != git_commit_parentcount(right))
+            return false;
+        for (size_t index = 0; index < count; ++index) {
+            if (git_oid_cmp(git_commit_parent_id(left, index),
+                            git_commit_parent_id(right, index)) != 0) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto sameAuthor = [](git_commit* left, git_commit* right) {
+        const git_signature* first = git_commit_author(left);
+        const git_signature* second = git_commit_author(right);
+        if (!first || !second)
+            return false;
+        return text(first->name) == text(second->name)
+            && text(first->email) == text(second->email)
+            && first->when.time == second->when.time
+            && first->when.offset == second->when.offset
+            && first->when.sign == second->when.sign;
+    };
+
+    auto amendHead = [this, &signature, &updateRewrittenMapping,
+                      &combinedMessage, &sameParents, &sameAuthor,
+                      &state, error](size_t currentIndex,
+                                     const RebasePlanItem& item) -> bool {
+        IndexHandle index;
+        CommitHandle head;
+        git_oid indexTreeOid;
+        if (git_repository_index(index.out(), _repository) < 0
+            || git_index_has_conflicts(index.get())
+            || !lookupHeadCommit(_repository, head)
+            || git_index_write_tree(&indexTreeOid, index.get()) < 0) {
+            return fail(error, QStringLiteral("Cannot prepare squash/fixup commit."));
+        }
+
+        const QString currentHead = oidText(git_commit_id(head.get()));
+        const QString indexTree = oidText(&indexTreeOid);
+        if (currentHead.compare(state.plan.preview.targetHash,
+                                Qt::CaseInsensitive) == 0) {
+            if (error) {
+                *error = QStringLiteral(
+                    "Cannot squash or fixup without a previous rewritten commit.");
+            }
+            return false;
+        }
+        if (state.pendingIndex == -1) {
+            state.pendingIndex = static_cast<int>(currentIndex);
+            state.preActionHead = currentHead;
+            state.pendingTree = indexTree;
+            if (!saveInteractiveRebase(_repository, state, error))
+                return false;
+        } else if (state.pendingIndex != static_cast<int>(currentIndex)
+                   || indexTree.compare(state.pendingTree,
+                                        Qt::CaseInsensitive) != 0) {
+            if (error) {
+                *error = QStringLiteral(
+                    "Interactive rebase pending state changed unexpectedly.");
+            }
+            return false;
+        }
+
+        CommitHandle previous;
+        if (!lookupCommit(_repository, state.preActionHead, previous, error,
+                          QStringLiteral("Cannot resolve pre-squash commit."))) {
+            return false;
+        }
+        const QString message = combinedMessage(previous.get(), item);
+        if (message.trimmed().isEmpty()) {
+            if (error)
+                *error = QStringLiteral("Squashed commit message cannot be empty.");
+            return false;
+        }
+
+        if (currentHead.compare(state.preActionHead,
+                                Qt::CaseInsensitive) != 0) {
+            TreeHandle currentTree;
+            if (git_commit_tree(currentTree.out(), head.get()) < 0
+                || oidText(git_tree_id(currentTree.get())).compare(
+                       state.pendingTree, Qt::CaseInsensitive) != 0
+                || text(git_commit_message(head.get())) != message
+                || !sameParents(head.get(), previous.get())
+                || !sameAuthor(head.get(), previous.get())) {
+                if (error) {
+                    *error = QStringLiteral(
+                        "Cannot safely recover the pending squash/fixup action.");
+                }
+                return false;
+            }
+            if (!updateRewrittenMapping(item.hash, state.preActionHead,
+                                        currentHead)) {
+                return false;
+            }
+            state.pendingIndex = -1;
+            state.preActionHead.clear();
+            state.pendingTree.clear();
+            return true;
+        }
+
+        TreeHandle tree;
+        if (git_tree_lookup(tree.out(), _repository, &indexTreeOid) < 0)
+            return fail(error, QStringLiteral("Cannot prepare squash/fixup tree."));
+        const QByteArray messageBytes = message.toUtf8();
+        git_oid amendedOid;
+        if (git_commit_amend(&amendedOid, previous.get(), "HEAD", nullptr,
+                             signature.get(), nullptr, messageBytes.constData(),
+                             tree.get()) < 0) {
+            return fail(error, QStringLiteral("Cannot create squash/fixup commit."));
+        }
+        CommitHandle verifiedHead;
+        if (!lookupHeadCommit(_repository, verifiedHead)
+            || git_oid_cmp(git_commit_id(verifiedHead.get()), &amendedOid) != 0) {
+            if (error)
+                *error = QStringLiteral("Cannot verify squash/fixup commit.");
+            return false;
+        }
+        if (!updateRewrittenMapping(item.hash, state.preActionHead,
+                                    oidText(&amendedOid))) {
+            return false;
+        }
+        state.pendingIndex = -1;
+        state.preActionHead.clear();
+        state.pendingTree.clear();
+        return true;
+    };
+
+    auto completeCurrent = [this, rebase, &plan, &signature, &restoreHeadTree,
+                            &amendHead, error](size_t current,
+                                               bool resumeEdit)
+        -> HistoryOperationResult {
+        if (current >= static_cast<size_t>(plan.items.size())) {
+            if (error)
+                *error = QStringLiteral("Interactive rebase position is invalid.");
+            return historyResult(HistoryOperationStatus::Completed,
+                                 error ? *error : QString());
+        }
+        const RebasePlanItem& item = plan.items.at(static_cast<int>(current));
+
+        IndexHandle index;
+        if (git_repository_index(index.out(), _repository) < 0)
+            return historyFailure(error, QStringLiteral("Cannot open rebase index."));
+        const bool conflicts = git_index_has_conflicts(index.get());
+        if (item.action != RebaseAction::Drop && conflicts) {
+            return historyResult(HistoryOperationStatus::Conflicts,
+                                 QStringLiteral("Rebase stopped because of conflicts."));
+        }
+
+        if (item.action == RebaseAction::Drop) {
+            if (!restoreHeadTree())
+                return historyResult(HistoryOperationStatus::Completed,
+                                     error ? *error : QString());
+            return historyResult(HistoryOperationStatus::Completed,
+                                 QStringLiteral("Dropped %1.").arg(item.hash.left(8)));
+        }
+
+        if (item.action == RebaseAction::Edit && !resumeEdit) {
+            return historyResult(HistoryOperationStatus::PausedForEdit,
+                                 QStringLiteral("Edit commit %1, stage the result, then continue.")
+                                     .arg(item.hash.left(8)));
+        }
+
+        if (item.action == RebaseAction::Squash
+            || item.action == RebaseAction::Fixup) {
+            if (!amendHead(current, item))
+                return historyResult(HistoryOperationStatus::Completed,
+                                     error ? *error : QString());
+            return historyResult(HistoryOperationStatus::Completed,
+                                 QStringLiteral("Combined %1.").arg(item.hash.left(8)));
+        }
+
+        QByteArray messageBytes;
+        const char* message = nullptr;
+        if (item.action == RebaseAction::Reword
+            || item.action == RebaseAction::Edit) {
+            const QString rewritten = item.rewrittenMessage.isEmpty()
+                ? item.message : item.rewrittenMessage;
+            if (rewritten.trimmed().isEmpty()) {
+                if (error)
+                    *error = QStringLiteral("Rebase commit message cannot be empty.");
+                return historyResult(HistoryOperationStatus::Completed,
+                                     error ? *error : QString());
+            }
+            messageBytes = rewritten.toUtf8();
+            message = messageBytes.constData();
+        }
+        git_oid commitOid;
+        const int commitRc = git_rebase_commit(&commitOid, rebase, nullptr,
+                                                signature.get(), nullptr,
+                                                message);
+        if (commitRc < 0 && commitRc != GIT_EAPPLIED) {
+            return historyFailure(error,
+                                  QStringLiteral("Cannot commit interactive rebase step."));
+        }
+        git_error_clear();
+        return historyResult(HistoryOperationStatus::Completed,
+                             QStringLiteral("Applied %1.").arg(item.hash.left(8)));
+    };
+
+    size_t current = git_rebase_operation_current(rebase);
+    if (current == GIT_REBASE_NO_OPERATION) {
+        if (completedIndex != -1 || state.pendingIndex != -1
+            || pausedForEdit) {
+            if (error)
+                *error = QStringLiteral("Interactive rebase position is invalid.");
+            return historyResult(HistoryOperationStatus::Completed,
+                                 error ? *error : QString());
+        }
+    } else {
+        const int currentIndex = static_cast<int>(current);
+        const bool positionValid = current < total
+            && completedIndex >= currentIndex - 1
+            && completedIndex <= currentIndex
+            && (state.pendingIndex == -1
+                || (state.pendingIndex == currentIndex
+                    && completedIndex == currentIndex - 1))
+            && (!pausedForEdit
+                || (state.pendingIndex == -1
+                    && completedIndex == currentIndex - 1
+                    && plan.items.at(currentIndex).action
+                        == RebaseAction::Edit));
+        if (!positionValid) {
+            if (error)
+                *error = QStringLiteral("Interactive rebase position is invalid.");
+            return historyResult(HistoryOperationStatus::Completed,
+                                 error ? *error : QString());
+        }
+    }
+
+    if (current != GIT_REBASE_NO_OPERATION
+        && completedIndex != static_cast<int>(current)) {
+        const HistoryOperationResult completed = completeCurrent(current,
+                                                                 pausedForEdit);
+        if (completed.status == HistoryOperationStatus::PausedForEdit) {
+            pausedForEdit = true;
+            if (!saveInteractiveRebase(_repository, state, error)) {
+                return historyResult(HistoryOperationStatus::Completed,
+                                     error ? *error : QString());
+            }
+            return completed;
+        }
+        if (completed.status == HistoryOperationStatus::Conflicts
+            || (error && !error->isEmpty())) {
+            return completed;
+        }
+        completedIndex = static_cast<int>(current);
+        pausedForEdit = false;
+        if (state.pendingIndex != -1
+            || !saveInteractiveRebase(_repository, state, error)) {
+            if (error && error->isEmpty()) {
+                *error = QStringLiteral(
+                    "Interactive rebase pending state was not completed.");
+            }
+            return historyResult(HistoryOperationStatus::Completed,
+                                 error ? *error : QString());
+        }
+    }
+
+    while (true) {
+        if (isCancelled()) {
+            if (error)
+                *error = QStringLiteral("Operation cancelled; rebase remains in progress.");
+            return historyResult(HistoryOperationStatus::Completed,
+                                 error ? *error : QString());
+        }
+
+        git_rebase_operation* operation = nullptr;
+        const int nextRc = git_rebase_next(&operation, rebase);
+        if (nextRc == GIT_ITEROVER)
+            break;
+
+        current = git_rebase_operation_current(rebase);
+        if (nextRc == GIT_EMERGECONFLICT) {
+            if (current < static_cast<size_t>(plan.items.size())
+                && plan.items.at(static_cast<int>(current)).action
+                    == RebaseAction::Drop) {
+                if (!restoreHeadTree()) {
+                    return historyResult(HistoryOperationStatus::Completed,
+                                         error ? *error : QString());
+                }
+                completedIndex = static_cast<int>(current);
+                pausedForEdit = false;
+                if (!saveInteractiveRebase(_repository, state, error)) {
+                    return historyResult(HistoryOperationStatus::Completed,
+                                         error ? *error : QString());
+                }
+                continue;
+            }
+            return historyResult(HistoryOperationStatus::Conflicts,
+                                 QStringLiteral("Rebase stopped because of conflicts."));
+        }
+        if (nextRc < 0)
+            return historyFailure(error,
+                                  QStringLiteral("Cannot apply next interactive rebase step."));
+        if (!operation || current >= static_cast<size_t>(plan.items.size())) {
+            if (error)
+                *error = QStringLiteral("Interactive rebase position is invalid.");
+            return historyResult(HistoryOperationStatus::Completed,
+                                 error ? *error : QString());
+        }
+
+        progress(QStringLiteral("Interactive rebase %1/%2")
+                     .arg(current + 1).arg(total),
+                 total > 0
+                     ? static_cast<int>((current + 1) * 100 / total) : -1);
+
+        const HistoryOperationResult completed = completeCurrent(current, false);
+        if (completed.status == HistoryOperationStatus::PausedForEdit) {
+            pausedForEdit = true;
+            if (!saveInteractiveRebase(_repository, state, error)) {
+                return historyResult(HistoryOperationStatus::Completed,
+                                     error ? *error : QString());
+            }
+            return completed;
+        }
+        if (completed.status == HistoryOperationStatus::Conflicts
+            || (error && !error->isEmpty())) {
+            return completed;
+        }
+        completedIndex = static_cast<int>(current);
+        pausedForEdit = false;
+        if (state.pendingIndex != -1
+            || !saveInteractiveRebase(_repository, state, error)) {
+            if (error && error->isEmpty()) {
+                *error = QStringLiteral(
+                    "Interactive rebase pending state was not completed.");
+            }
+            return historyResult(HistoryOperationStatus::Completed,
+                                 error ? *error : QString());
+        }
+    }
+
+    if (state.pendingIndex != -1) {
+        if (error)
+            *error = QStringLiteral("Interactive rebase has an incomplete pending action.");
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+    if (git_rebase_finish(rebase, signature.get()) < 0)
+        return historyFailure(error, QStringLiteral("Cannot finish interactive rebase."));
+    if (!removeInteractiveRebase(_repository, error)) {
+        return historyResult(HistoryOperationStatus::Completed,
+                             error ? *error : QString());
+    }
+    progress(QStringLiteral("Interactive rebase completed"), 100);
+    return historyResult(HistoryOperationStatus::Completed,
+                         QStringLiteral("Interactive rebase completed."));
 }
 
 bool LibGit2Backend::createStateCommit(const QString& operation,

@@ -1,12 +1,16 @@
 #include "widgets/CommitGraphWidget.h"
+#include "widgets/BranchListWidget.h"
 
 #include <QApplication>
+#include <QAction>
 #include <QComboBox>
+#include <QMenu>
 #include <QPersistentModelIndex>
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalSpy>
 #include <QTemporaryDir>
+#include <QTimer>
 #include <QTreeView>
 #include <QtTest>
 
@@ -24,6 +28,78 @@ class TestCommitGraphWidget : public QObject {
         commit.date = QDateTime::fromSecsSinceEpoch(1700000000, Qt::UTC);
         commit.subject = subject;
         return commit;
+    }
+
+    static QMenu* visibleMenu()
+    {
+        QMenu* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
+        if (menu)
+            return menu;
+        for (QWidget* topLevel : QApplication::topLevelWidgets()) {
+            menu = qobject_cast<QMenu*>(topLevel);
+            if (menu && menu->isVisible())
+                return menu;
+        }
+        return nullptr;
+    }
+
+    static void scheduleMenuFailsafe()
+    {
+        QTimer::singleShot(250, [] {
+            if (QMenu* menu = visibleMenu())
+                menu->close();
+        });
+    }
+
+    static bool triggerContextAction(CommitGraphWidget* widget, QTreeView* view,
+                                     const QString& objectName, bool* enabled)
+    {
+        bool found = false;
+        QTimer::singleShot(0, [&] {
+            QMenu* menu = visibleMenu();
+            if (!menu)
+                return;
+            QAction* action = menu->findChild<QAction*>(objectName);
+            if (action) {
+                found = true;
+                *enabled = action->isEnabled();
+                if (*enabled)
+                    action->trigger();
+            }
+            menu->close();
+        });
+        scheduleMenuFailsafe();
+
+        const QModelIndex index = view->model()->index(0, CommitGraphModel::ColMessage);
+        const QPoint position = view->visualRect(index).center();
+        const bool invoked = QMetaObject::invokeMethod(
+            widget, "slotContextMenu", Qt::DirectConnection, Q_ARG(QPoint, position));
+        return invoked && found;
+    }
+
+    static bool triggerBranchAction(BranchListWidget* widget,
+                                    QTreeWidgetItem* item,
+                                    const QString& objectName, bool* enabled)
+    {
+        bool found = false;
+        QTimer::singleShot(0, [&] {
+            QMenu* menu = visibleMenu();
+            if (!menu)
+                return;
+            QAction* action = menu->findChild<QAction*>(objectName);
+            if (action) {
+                found = true;
+                *enabled = action->isEnabled();
+                if (*enabled)
+                    action->trigger();
+            }
+            menu->close();
+        });
+        scheduleMenuFailsafe();
+        const QPoint position = widget->visualItemRect(item).center();
+        const bool invoked = QMetaObject::invokeMethod(
+            widget, "slotContextMenu", Qt::DirectConnection, Q_ARG(QPoint, position));
+        return invoked && found;
     }
 
 private slots:
@@ -228,6 +304,92 @@ private slots:
         finalPage.hasMore = false;
         widget.appendHistory(finalPage);
         QVERIFY(!loadMore->isEnabled());
+    }
+
+    void historyActionsExposeMainlineAndHonorBusyState()
+    {
+        const QString firstParent(40, QLatin1Char('a'));
+        const QString secondParent(40, QLatin1Char('b'));
+        const Git::Commit merge = makeCommit(QLatin1Char('c'),
+                                              QStringLiteral("merge commit"),
+                                              {firstParent, secondParent});
+        CommitGraphWidget widget;
+        widget.resize(900, 500);
+        Git::CommitHistoryPage page;
+        page.commits = {merge};
+        widget.resetHistory(page);
+        widget.show();
+        QCoreApplication::processEvents();
+
+        auto* view = widget.findChild<QTreeView*>(QStringLiteral("commitHistoryView"));
+        QVERIFY(view);
+        QSignalSpy cherryPickSpy(&widget,
+                                 &CommitGraphWidget::sigCherryPickRequested);
+        QSignalSpy resetSpy(&widget, &CommitGraphWidget::sigResetRequested);
+
+        widget.setOperationsEnabled(true);
+        bool enabled = false;
+        QVERIFY(triggerContextAction(
+            &widget, view, QStringLiteral("historyCherryPickMainline2Action"),
+            &enabled));
+        QVERIFY(enabled);
+        QCOMPARE(cherryPickSpy.count(), 1);
+        QCOMPARE(cherryPickSpy.first().at(0).toString(), merge.hash);
+        QCOMPARE(cherryPickSpy.first().at(1).toInt(), 2);
+
+        widget.setOperationsEnabled(false);
+        enabled = true;
+        QVERIFY(triggerContextAction(
+            &widget, view, QStringLiteral("historyResetAction"), &enabled));
+        QVERIFY(!enabled);
+        QCOMPARE(resetSpy.count(), 0);
+    }
+
+    void branchActionsRejectCurrentBranchAndEmitTargets()
+    {
+        Git::Branch current;
+        current.name = QStringLiteral("main");
+        current.fullName = QStringLiteral("refs/heads/main");
+        current.isCurrent = true;
+        Git::Branch feature;
+        feature.name = QStringLiteral("feature");
+        feature.fullName = QStringLiteral("refs/heads/feature");
+
+        BranchListWidget widget;
+        widget.resize(360, 420);
+        widget.setBranches({current, feature});
+        widget.setOperationsEnabled(true);
+        widget.show();
+        QCoreApplication::processEvents();
+
+        QTreeWidgetItem* localRoot = widget.topLevelItem(0);
+        QVERIFY(localRoot);
+        QCOMPARE(localRoot->childCount(), 2);
+        QSignalSpy mergeSpy(&widget, &BranchListWidget::sigMergeRequested);
+        QSignalSpy checkoutSpy(&widget, &BranchListWidget::sigCheckoutRequested);
+
+        widget.setOperationsEnabled(false);
+        QTest::mouseDClick(widget.viewport(), Qt::LeftButton, Qt::NoModifier,
+                          widget.visualItemRect(localRoot->child(1)).center());
+        QCOMPARE(checkoutSpy.count(), 0);
+        widget.setOperationsEnabled(true);
+        QTest::mouseDClick(widget.viewport(), Qt::LeftButton, Qt::NoModifier,
+                          widget.visualItemRect(localRoot->child(1)).center());
+        QCOMPARE(checkoutSpy.count(), 1);
+        QCOMPARE(checkoutSpy.first().at(0).toString(), QStringLiteral("feature"));
+
+        bool enabled = true;
+        QVERIFY(triggerBranchAction(&widget, localRoot->child(0),
+                                    QStringLiteral("branchMergeAction"), &enabled));
+        QVERIFY(!enabled);
+        QCOMPARE(mergeSpy.count(), 0);
+
+        enabled = false;
+        QVERIFY(triggerBranchAction(&widget, localRoot->child(1),
+                                    QStringLiteral("branchMergeAction"), &enabled));
+        QVERIFY(enabled);
+        QCOMPARE(mergeSpy.count(), 1);
+        QCOMPARE(mergeSpy.first().at(0).toString(), QStringLiteral("feature"));
     }
 
 private:

@@ -9,6 +9,8 @@
 
 namespace Git {
 
+struct InteractiveRebaseState;
+
 struct RemoteCredentials {
     QString username;
     QString secret;
@@ -52,6 +54,23 @@ public:
 
     bool commit(const QString& message, bool amend, bool signoff,
                 QString* error = nullptr);
+    HistoryRewritePreview resetPreview(const QString& revision,
+                                       QString* error = nullptr) const;
+    RebasePlan rebasePlan(const QString& revision,
+                          QString* error = nullptr) const;
+    HistoryOperationResult mergeRevision(const QString& revision,
+                                         QString* error = nullptr);
+    HistoryOperationResult rebaseOnto(const RebasePlan& plan, bool interactive,
+                                      QString* error = nullptr);
+    HistoryOperationResult cherryPickCommit(const QString& revision,
+                                             unsigned int mainline = 0,
+                                             QString* error = nullptr);
+    HistoryOperationResult revertCommit(const QString& revision,
+                                        unsigned int mainline = 0,
+                                        QString* error = nullptr);
+    HistoryOperationResult resetToCommit(const HistoryRewritePreview& preview,
+                                         ResetMode mode,
+                                         QString* error = nullptr);
     bool checkoutBranch(const QString& name, QString* error = nullptr);
     bool createBranch(const QString& name, const QString& from,
                       QString* error = nullptr);
@@ -74,6 +93,8 @@ public:
     bool stashDrop(size_t index, QString* error = nullptr);
 
     bool resolveConflict(const QString& path, bool ours, QString* error = nullptr);
+    HistoryOperationResult continueHistoryOperation(
+        const QString& operation, QString* error = nullptr);
     bool continueOperation(const QString& operation, QString* error = nullptr);
     bool abortOperation(const QString& operation, QString* error = nullptr);
 
@@ -83,6 +104,10 @@ public:
 private:
     bool fetchRemote(const QString& name, bool prune, QString* error);
     bool finishRebase(git_rebase* rebase, QString* error);
+    HistoryOperationResult finishRebaseResult(git_rebase* rebase,
+                                              QString* error);
+    HistoryOperationResult finishInteractiveRebase(
+        git_rebase* rebase, InteractiveRebaseState state, QString* error);
     bool createStateCommit(const QString& operation, QString* error);
     bool isCancelled() const;
     void progress(const QString& text, int percent = -1) const;

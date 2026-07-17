@@ -496,19 +496,84 @@ void CommitGraphWidget::slotContextMenu(const QPoint& pos)
     }
 
     menu.addSeparator();
-    menu.addAction(QStringLiteral("Add tag here…"), [this, hash] {
+    QAction* createBranch = menu.addAction(QStringLiteral("Create Branch Here..."),
+                                           [this, hash] {
+        emit sigCreateBranchRequested(hash);
+    });
+    createBranch->setObjectName(QStringLiteral("historyCreateBranchAction"));
+    QAction* merge = menu.addAction(QStringLiteral("Merge This Commit into Current Branch"),
+                                    [this, hash] {
+        emit sigMergeRequested(hash);
+    });
+    merge->setObjectName(QStringLiteral("historyMergeAction"));
+    QAction* rebase = menu.addAction(QStringLiteral("Rebase Current Branch onto This Commit..."),
+                                     [this, hash] {
+        emit sigRebaseRequested(hash);
+    });
+    rebase->setObjectName(QStringLiteral("historyRebaseAction"));
+
+    if (commit.parents.size() <= 1) {
+        QAction* cherryPick = menu.addAction(QStringLiteral("Cherry-pick Commit"),
+                                             [this, hash] {
+            emit sigCherryPickRequested(hash, 0);
+        });
+        cherryPick->setObjectName(QStringLiteral("historyCherryPickAction"));
+        QAction* revert = menu.addAction(QStringLiteral("Revert Commit"),
+                                         [this, hash] {
+            emit sigRevertRequested(hash, 0);
+        });
+        revert->setObjectName(QStringLiteral("historyRevertAction"));
+        cherryPick->setEnabled(_operationsEnabled);
+        revert->setEnabled(_operationsEnabled);
+    } else {
+        QMenu* cherryPickMenu = menu.addMenu(QStringLiteral("Cherry-pick Merge Commit"));
+        QMenu* revertMenu = menu.addMenu(QStringLiteral("Revert Merge Commit"));
+        for (int parent = 0; parent < commit.parents.size(); ++parent) {
+            const int mainline = parent + 1;
+            const QString label = QStringLiteral("Use parent %1 (%2) as mainline")
+                                      .arg(mainline)
+                                      .arg(commit.parents.at(parent).left(8));
+            QAction* cherryPick = cherryPickMenu->addAction(label, [this, hash, mainline] {
+                emit sigCherryPickRequested(hash, mainline);
+            });
+            cherryPick->setObjectName(
+                QStringLiteral("historyCherryPickMainline%1Action").arg(mainline));
+            QAction* revert = revertMenu->addAction(label, [this, hash, mainline] {
+                emit sigRevertRequested(hash, mainline);
+            });
+            revert->setObjectName(
+                QStringLiteral("historyRevertMainline%1Action").arg(mainline));
+        }
+        cherryPickMenu->setEnabled(_operationsEnabled);
+        revertMenu->setEnabled(_operationsEnabled);
+    }
+
+    QAction* reset = menu.addAction(QStringLiteral("Reset Current Branch to This Commit..."),
+                                    [this, hash] {
+        emit sigResetRequested(hash);
+    });
+    reset->setObjectName(QStringLiteral("historyResetAction"));
+    createBranch->setEnabled(_operationsEnabled);
+    merge->setEnabled(_operationsEnabled);
+    rebase->setEnabled(_operationsEnabled);
+    reset->setEnabled(_operationsEnabled);
+
+    menu.addSeparator();
+    QAction* addTag = menu.addAction(QStringLiteral("Add tag here…"), [this, hash] {
         emit sigCreateTagRequested(hash);
     });
+    addTag->setEnabled(_operationsEnabled);
 
     // 解析当前提交上的标签，每个标签提供一个删除项
     for (const QString& ref : commit.refs) {
         if (ref.startsWith(QLatin1String("tag: "))) {
             const QString tagName = ref.mid(5);
-            menu.addAction(
+            QAction* deleteTag = menu.addAction(
                 QStringLiteral("Delete tag: %1").arg(tagName),
                 [this, tagName]() {
                     emit sigDeleteTagRequested(tagName);
                 });
+            deleteTag->setEnabled(_operationsEnabled);
         }
     }
 

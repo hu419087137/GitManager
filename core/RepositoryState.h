@@ -15,12 +15,14 @@ struct RepositoryState {
     int behind {0};
     bool detached {false};
     bool unborn {false};
+    RepositoryOperation activeOperation {RepositoryOperation::None};
     QString refsVersion;
     QVector<Branch> branches;
     QVector<File> files;
 
     QString displayHead() const;
     QString syncText() const;
+    QString activeOperationText() const;
 };
 
 } // namespace Git

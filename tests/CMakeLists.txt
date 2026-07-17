@@ -38,6 +38,7 @@ add_test(NAME GitManager COMMAND TestGitManager)
 
 add_executable(TestCommitGraphWidget
     unit/TestCommitGraphWidget.cpp
+    ../widgets/BranchListWidget.cpp
     ../widgets/CommitGraphWidget.cpp
 )
 target_include_directories(TestCommitGraphWidget PRIVATE ..)
@@ -49,6 +50,23 @@ target_link_libraries(TestCommitGraphWidget PRIVATE
 )
 add_test(NAME CommitGraphWidget COMMAND TestCommitGraphWidget)
 set_tests_properties(CommitGraphWidget PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_executable(TestHistoryDialogs
+    unit/TestHistoryDialogs.cpp
+    ../dialogs/RebaseDialog.cpp
+    ../dialogs/ResetDialog.cpp
+    ../widgets/InteractiveRebaseWidget.cpp
+)
+target_include_directories(TestHistoryDialogs PRIVATE ..)
+target_link_libraries(TestHistoryDialogs PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Test
+)
+add_test(NAME HistoryDialogs COMMAND TestHistoryDialogs)
+set_tests_properties(HistoryDialogs PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 gitmanager_add_openssl_deployment(

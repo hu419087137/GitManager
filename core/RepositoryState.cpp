@@ -21,4 +21,17 @@ QString RepositoryState::syncText() const
     return QStringLiteral("↑%1 ↓%2").arg(ahead).arg(behind);
 }
 
+QString RepositoryState::activeOperationText() const
+{
+    switch (activeOperation) {
+    case RepositoryOperation::None:       return {};
+    case RepositoryOperation::Merge:      return QStringLiteral("merge");
+    case RepositoryOperation::Rebase:     return QStringLiteral("rebase");
+    case RepositoryOperation::CherryPick: return QStringLiteral("cherry-pick");
+    case RepositoryOperation::Revert:     return QStringLiteral("revert");
+    case RepositoryOperation::Unknown:    return QStringLiteral("unknown");
+    }
+    return QStringLiteral("unknown");
+}
+
 } // namespace Git

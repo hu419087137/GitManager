@@ -1,7 +1,12 @@
 #include "core/LibGit2Backend.h"
 #include <git2.h>
+#include <git2/transaction.h>
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QMap>
 #include <QSet>
 #include <QTemporaryDir>
@@ -237,6 +242,314 @@ class TestRepository : public QObject {
         QCOMPARE(git_config_set_string(config, "user.name", "Test User"), 0);
         QCOMPARE(git_config_set_string(config, "user.email", "test@example.com"), 0);
         git_config_free(config);
+    }
+
+    static bool writeFiles(const QString& root,
+                           const QMap<QString, QByteArray>& files,
+                           QString* error)
+    {
+        for (auto it = files.cbegin(); it != files.cend(); ++it) {
+            QFile file(QDir(root).filePath(it.key()));
+            if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                if (error)
+                    *error = file.errorString();
+                return false;
+            }
+            if (file.write(it.value()) != it.value().size()) {
+                if (error)
+                    *error = file.errorString();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool commitFiles(Git::LibGit2Backend& backend, const QString& root,
+                            const QMap<QString, QByteArray>& files,
+                            const QString& message, QString* hash,
+                            QString* error)
+    {
+        if (!writeFiles(root, files, error)
+            || !backend.stageAll(error)
+            || !backend.commit(message, false, false, error)) {
+            return false;
+        }
+        const Git::RepositoryState state = backend.snapshot(error);
+        if (error && !error->isEmpty())
+            return false;
+        if (hash)
+            *hash = state.headHash;
+        return !state.headHash.isEmpty();
+    }
+
+    static bool initializeConfigured(Git::LibGit2Backend& backend,
+                                     const QString& path, QString* error)
+    {
+        if (!backend.initialize(path, error))
+            return false;
+        git_repository* repo = nullptr;
+        if (!checkGit(git_repository_open(&repo, path.toUtf8().constData()),
+                      QStringLiteral("Cannot open configured repository"), error)) {
+            return false;
+        }
+        git_config* config = nullptr;
+        bool ok = checkGit(git_repository_config(&config, repo),
+                           QStringLiteral("Cannot open repository config"), error)
+            && checkGit(git_config_set_string(config, "user.name", "Test User"),
+                        QStringLiteral("Cannot set user.name"), error)
+            && checkGit(git_config_set_string(config, "user.email", "test@example.com"),
+                        QStringLiteral("Cannot set user.email"), error);
+        git_config_free(config);
+        git_repository_free(repo);
+        return ok;
+    }
+
+    static int commitParentCount(const QString& path, const QString& revision,
+                                 QString* error)
+    {
+        git_repository* repo = nullptr;
+        git_object* object = nullptr;
+        git_object* peeled = nullptr;
+        int result = -1;
+        if (checkGit(git_repository_open(&repo, path.toUtf8().constData()),
+                     QStringLiteral("Cannot open repository"), error)
+            && checkGit(git_revparse_single(&object, repo,
+                                            revision.toUtf8().constData()),
+                        QStringLiteral("Cannot resolve commit"), error)
+            && checkGit(git_object_peel(&peeled, object, GIT_OBJECT_COMMIT),
+                        QStringLiteral("Cannot peel commit"), error)) {
+            result = static_cast<int>(git_commit_parentcount(
+                reinterpret_cast<git_commit*>(peeled)));
+        }
+        git_object_free(peeled);
+        git_object_free(object);
+        git_repository_free(repo);
+        return result;
+    }
+
+    static QString commitMessage(const QString& path, const QString& revision,
+                                 QString* error)
+    {
+        git_repository* repo = nullptr;
+        git_object* object = nullptr;
+        git_object* peeled = nullptr;
+        QString result;
+        if (checkGit(git_repository_open(&repo, path.toUtf8().constData()),
+                     QStringLiteral("Cannot open repository"), error)
+            && checkGit(git_revparse_single(&object, repo,
+                                            revision.toUtf8().constData()),
+                        QStringLiteral("Cannot resolve commit"), error)
+            && checkGit(git_object_peel(&peeled, object, GIT_OBJECT_COMMIT),
+                        QStringLiteral("Cannot peel commit"), error)) {
+            result = QString::fromUtf8(git_commit_message(
+                reinterpret_cast<git_commit*>(peeled)));
+        }
+        git_object_free(peeled);
+        git_object_free(object);
+        git_repository_free(repo);
+        return result;
+    }
+
+    static bool setConfigString(const QString& path, const char* name,
+                                const char* value, QString* error)
+    {
+        git_repository* repo = nullptr;
+        git_config* config = nullptr;
+        const bool opened = checkGit(
+            git_repository_open(&repo, path.toUtf8().constData()),
+            QStringLiteral("Cannot open repository"), error)
+            && checkGit(git_repository_config(&config, repo),
+                        QStringLiteral("Cannot open repository config"), error);
+        const bool result = opened
+            && checkGit(git_config_set_string(config, name, value),
+                        QStringLiteral("Cannot update repository config"), error);
+        git_config_free(config);
+        git_repository_free(repo);
+        return result;
+    }
+
+    static bool createNote(const QString& path, const QString& target,
+                           const QString& message, QString* error)
+    {
+        git_repository* repo = nullptr;
+        git_signature* signature = nullptr;
+        git_oid targetOid;
+        git_oid noteOid;
+        bool result = checkGit(
+            git_repository_open(&repo, path.toUtf8().constData()),
+            QStringLiteral("Cannot open repository"), error)
+            && checkGit(git_oid_fromstr(&targetOid,
+                                        target.toLatin1().constData()),
+                        QStringLiteral("Cannot parse note target"), error)
+            && checkGit(git_signature_default(&signature, repo),
+                        QStringLiteral("Cannot create note signature"), error);
+        if (result) {
+            const QByteArray note = message.toUtf8();
+            result = checkGit(git_note_create(
+                                  &noteOid, repo, "refs/notes/commits",
+                                  signature, signature, &targetOid,
+                                  note.constData(), 0),
+                              QStringLiteral("Cannot create note"), error);
+        }
+        git_signature_free(signature);
+        git_repository_free(repo);
+        return result;
+    }
+
+    static QString noteMessage(const QString& path, const QString& target,
+                               QString* error)
+    {
+        git_repository* repo = nullptr;
+        git_note* note = nullptr;
+        git_oid targetOid;
+        QString result;
+        if (checkGit(git_repository_open(&repo, path.toUtf8().constData()),
+                     QStringLiteral("Cannot open repository"), error)
+            && checkGit(git_oid_fromstr(&targetOid,
+                                        target.toLatin1().constData()),
+                        QStringLiteral("Cannot parse note target"), error)
+            && checkGit(git_note_read(&note, repo, "refs/notes/commits",
+                                      &targetOid),
+                        QStringLiteral("Cannot read note"), error)) {
+            result = QString::fromUtf8(git_note_message(note));
+        }
+        git_note_free(note);
+        git_repository_free(repo);
+        return result;
+    }
+
+    static bool createEmptyCommit(const QString& path, const QString& message,
+                                  QString* hash, QString* error)
+    {
+        git_repository* repo = nullptr;
+        git_reference* head = nullptr;
+        git_commit* parent = nullptr;
+        git_tree* tree = nullptr;
+        git_signature* signature = nullptr;
+        git_oid commitOid;
+        bool result = checkGit(
+            git_repository_open(&repo, path.toUtf8().constData()),
+            QStringLiteral("Cannot open repository"), error)
+            && checkGit(git_repository_head(&head, repo),
+                        QStringLiteral("Cannot resolve HEAD"), error)
+            && checkGit(git_reference_peel(
+                            reinterpret_cast<git_object**>(&parent), head,
+                            GIT_OBJECT_COMMIT),
+                        QStringLiteral("Cannot resolve HEAD commit"), error)
+            && checkGit(git_commit_tree(&tree, parent),
+                        QStringLiteral("Cannot resolve HEAD tree"), error)
+            && checkGit(git_signature_default(&signature, repo),
+                        QStringLiteral("Cannot create commit signature"), error);
+        if (result) {
+            const QByteArray commitMessage = message.toUtf8();
+            const git_commit* parents[] = {parent};
+            result = checkGit(git_commit_create(
+                                  &commitOid, repo, "HEAD", signature,
+                                  signature, nullptr,
+                                  commitMessage.constData(), tree, 1, parents),
+                              QStringLiteral("Cannot create empty commit"), error);
+        }
+        if (result && hash)
+            *hash = oidText(&commitOid);
+        git_signature_free(signature);
+        git_tree_free(tree);
+        git_commit_free(parent);
+        git_reference_free(head);
+        git_repository_free(repo);
+        return result;
+    }
+
+    static bool createDirectReference(const QString& path, const char* name,
+                                      const QString& target, QString* error)
+    {
+        git_repository* repo = nullptr;
+        git_reference* reference = nullptr;
+        git_oid oid;
+        bool result = checkGit(
+            git_repository_open(&repo, path.toUtf8().constData()),
+            QStringLiteral("Cannot open repository"), error);
+        if (result && git_oid_fromstr(&oid, target.toLatin1().constData()) < 0)
+            result = checkGit(-1, QStringLiteral("Cannot parse reference target"), error);
+        if (result) {
+            result = checkGit(git_reference_create(
+                                  &reference, repo, name, &oid, 1,
+                                  "published history test"),
+                              QStringLiteral("Cannot create reference"), error);
+        }
+        git_reference_free(reference);
+        git_repository_free(repo);
+        return result;
+    }
+
+    static bool descendantOf(const QString& path, const QString& descendant,
+                             const QString& ancestor, QString* error)
+    {
+        git_repository* repo = nullptr;
+        git_oid descendantOid;
+        git_oid ancestorOid;
+        bool result = false;
+        if (checkGit(git_repository_open(&repo, path.toUtf8().constData()),
+                     QStringLiteral("Cannot open repository"), error)
+            && checkGit(git_oid_fromstr(&descendantOid,
+                                        descendant.toLatin1().constData()),
+                        QStringLiteral("Cannot parse descendant"), error)
+            && checkGit(git_oid_fromstr(&ancestorOid,
+                                        ancestor.toLatin1().constData()),
+                        QStringLiteral("Cannot parse ancestor"), error)) {
+            const int rc = git_graph_descendant_of(repo, &descendantOid,
+                                                   &ancestorOid);
+            if (rc < 0)
+                checkGit(rc, QStringLiteral("Cannot inspect graph"), error);
+            else
+                result = rc == 1 || git_oid_equal(&descendantOid, &ancestorOid);
+        }
+        git_repository_free(repo);
+        return result;
+    }
+
+    static QByteArray fileContents(const QString& root, const QString& path)
+    {
+        QFile file(QDir(root).filePath(path));
+        return file.open(QIODevice::ReadOnly)
+            ? file.readAll().replace("\r\n", "\n") : QByteArray();
+    }
+
+    static bool setHeadRef(const QString& path, const char* name, QString* error)
+    {
+        git_repository* repo = nullptr;
+        const bool result = checkGit(
+            git_repository_open(&repo, path.toUtf8().constData()),
+            QStringLiteral("Cannot open repository"), error)
+            && checkGit(git_repository_set_head(repo, name),
+                        QStringLiteral("Cannot update HEAD"), error);
+        git_repository_free(repo);
+        return result;
+    }
+
+    static bool writeRepositoryStateFile(const QString& root,
+                                         const QString& relativePath,
+                                         const QByteArray& data,
+                                         QString* error)
+    {
+        const QString path = QDir(root).filePath(relativePath);
+        QFileInfo info(path);
+        if (!QDir().mkpath(info.path())) {
+            if (error)
+                *error = QStringLiteral("Cannot create state directory.");
+            return false;
+        }
+        QFile file(path);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            if (error)
+                *error = file.errorString();
+            return false;
+        }
+        if (file.write(data) != data.size()) {
+            if (error)
+                *error = file.errorString();
+            return false;
+        }
+        return true;
     }
 
 private slots:
@@ -650,6 +963,1216 @@ private slots:
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QCOMPARE(page.commits.size(), 1);
         QCOMPARE(page.commits.first().hash, fixture.targetAdded);
+    }
+
+    void historyMergeSupportsFastForwardNormalAndConflict()
+    {
+        {
+            QTemporaryDir dir; QVERIFY(dir.isValid());
+            Git::LibGit2Backend backend; QString error;
+            QVERIFY2(initializeConfigured(backend, dir.path(), &error), qPrintable(error));
+            QString base;
+            QVERIFY2(commitFiles(backend, dir.path(), {{QStringLiteral("base.txt"), "base\n"}},
+                                 QStringLiteral("base"), &base, &error), qPrintable(error));
+            const QString mainBranch = backend.snapshot(&error).headName;
+            QVERIFY2(backend.createBranch(QStringLiteral("feature"), {}, &error), qPrintable(error));
+            QString feature;
+            QVERIFY2(commitFiles(backend, dir.path(), {{QStringLiteral("feature.txt"), "feature\n"}},
+                                 QStringLiteral("feature"), &feature, &error), qPrintable(error));
+            QVERIFY2(backend.checkoutBranch(mainBranch, &error), qPrintable(error));
+
+            QFile untracked(dir.filePath(QStringLiteral("untracked.txt")));
+            QVERIFY(untracked.open(QIODevice::WriteOnly));
+            untracked.write("keep\n"); untracked.close();
+            auto result = backend.mergeRevision(QStringLiteral("feature"), &error);
+            QVERIFY(!error.isEmpty());
+            QCOMPARE(backend.snapshot(nullptr).headHash, base);
+            QVERIFY(QFile::remove(untracked.fileName()));
+
+            error.clear();
+            result = backend.mergeRevision(QStringLiteral("feature"), &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(result.status, Git::HistoryOperationStatus::Completed);
+            QCOMPARE(backend.snapshot(&error).headHash, feature);
+            result = backend.mergeRevision(QStringLiteral("feature"), &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(result.status, Git::HistoryOperationStatus::UpToDate);
+        }
+
+        {
+            QTemporaryDir dir; QVERIFY(dir.isValid());
+            Git::LibGit2Backend backend; QString error;
+            QVERIFY2(initializeConfigured(backend, dir.path(), &error), qPrintable(error));
+            QVERIFY(commitFiles(backend, dir.path(), {{QStringLiteral("base.txt"), "base\n"}},
+                                QStringLiteral("base"), nullptr, &error));
+            const QString mainBranch = backend.snapshot(&error).headName;
+            QVERIFY(backend.createBranch(QStringLiteral("feature"), {}, &error));
+            QVERIFY(commitFiles(backend, dir.path(), {{QStringLiteral("feature.txt"), "feature\n"}},
+                                QStringLiteral("feature"), nullptr, &error));
+            QVERIFY(backend.checkoutBranch(mainBranch, &error));
+            QVERIFY(commitFiles(backend, dir.path(), {{QStringLiteral("main.txt"), "main\n"}},
+                                QStringLiteral("main"), nullptr, &error));
+            const auto result = backend.mergeRevision(QStringLiteral("feature"), &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(result.status, Git::HistoryOperationStatus::Completed);
+            QCOMPARE(commitParentCount(dir.path(), backend.snapshot(&error).headHash, &error), 2);
+        }
+
+        {
+            QTemporaryDir dir; QVERIFY(dir.isValid());
+            Git::LibGit2Backend backend; QString error;
+            QVERIFY2(initializeConfigured(backend, dir.path(), &error), qPrintable(error));
+            QVERIFY(commitFiles(backend, dir.path(),
+                                {{QStringLiteral("base.txt"), "base\n"}},
+                                QStringLiteral("base"), nullptr, &error));
+            const QString mainBranch = backend.snapshot(&error).headName;
+            QVERIFY(backend.createBranch(QStringLiteral("feature"), {}, &error));
+            QVERIFY(commitFiles(backend, dir.path(),
+                                {{QStringLiteral("feature.txt"), "feature\n"}},
+                                QStringLiteral("feature"), nullptr, &error));
+            QVERIFY(backend.checkoutBranch(mainBranch, &error));
+            QVERIFY2(setConfigString(dir.path(), "merge.ff", "false", &error),
+                     qPrintable(error));
+
+            const auto result = backend.mergeRevision(QStringLiteral("feature"), &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(result.status, Git::HistoryOperationStatus::Completed);
+            QCOMPARE(commitParentCount(dir.path(), backend.snapshot(&error).headHash,
+                                       &error), 2);
+        }
+
+        {
+            QTemporaryDir dir; QVERIFY(dir.isValid());
+            Git::LibGit2Backend backend; QString error;
+            QVERIFY2(initializeConfigured(backend, dir.path(), &error), qPrintable(error));
+            QVERIFY(commitFiles(backend, dir.path(),
+                                {{QStringLiteral("base.txt"), "base\n"}},
+                                QStringLiteral("base"), nullptr, &error));
+            const QString mainBranch = backend.snapshot(&error).headName;
+            QVERIFY(backend.createBranch(QStringLiteral("feature"), {}, &error));
+            QVERIFY(commitFiles(backend, dir.path(),
+                                {{QStringLiteral("feature.txt"), "feature\n"}},
+                                QStringLiteral("feature"), nullptr, &error));
+            QVERIFY(backend.checkoutBranch(mainBranch, &error));
+            QString mainHead;
+            QVERIFY(commitFiles(backend, dir.path(),
+                                {{QStringLiteral("main.txt"), "main\n"}},
+                                QStringLiteral("main"), &mainHead, &error));
+            QVERIFY2(setConfigString(dir.path(), "merge.ff", "only", &error),
+                     qPrintable(error));
+
+            const auto result = backend.mergeRevision(QStringLiteral("feature"), &error);
+            Q_UNUSED(result)
+            QVERIFY(!error.isEmpty());
+            const Git::RepositoryState state = backend.snapshot(nullptr);
+            QCOMPARE(state.headHash, mainHead);
+            QCOMPARE(state.activeOperation, Git::RepositoryOperation::None);
+        }
+
+        {
+            QTemporaryDir dir; QVERIFY(dir.isValid());
+            Git::LibGit2Backend backend; QString error;
+            QVERIFY2(initializeConfigured(backend, dir.path(), &error), qPrintable(error));
+            QVERIFY(commitFiles(backend, dir.path(), {{QStringLiteral("conflict.txt"), "base\n"}},
+                                QStringLiteral("base"), nullptr, &error));
+            const QString mainBranch = backend.snapshot(&error).headName;
+            QVERIFY(backend.createBranch(QStringLiteral("feature"), {}, &error));
+            QVERIFY(commitFiles(backend, dir.path(), {{QStringLiteral("conflict.txt"), "feature\n"}},
+                                QStringLiteral("feature"), nullptr, &error));
+            QVERIFY(backend.checkoutBranch(mainBranch, &error));
+            QVERIFY(commitFiles(backend, dir.path(), {{QStringLiteral("conflict.txt"), "main\n"}},
+                                QStringLiteral("main"), nullptr, &error));
+
+            const auto result = backend.mergeRevision(QStringLiteral("feature"), &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(result.status, Git::HistoryOperationStatus::Conflicts);
+            QCOMPARE(backend.snapshot(&error).activeOperation, Git::RepositoryOperation::Merge);
+            QVERIFY2(backend.resolveConflict(QStringLiteral("conflict.txt"), false, &error),
+                     qPrintable(error));
+            const auto continued = backend.continueHistoryOperation(QStringLiteral("merge"), &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(continued.status, Git::HistoryOperationStatus::Completed);
+            QCOMPARE(backend.snapshot(&error).activeOperation, Git::RepositoryOperation::None);
+            QCOMPARE(fileContents(dir.path(), QStringLiteral("conflict.txt")), QByteArray("feature\n"));
+        }
+
+        {
+            QTemporaryDir dir; QVERIFY(dir.isValid());
+            Git::LibGit2Backend backend; QString error;
+            QVERIFY2(initializeConfigured(backend, dir.path(), &error), qPrintable(error));
+            QString base;
+            QVERIFY2(commitFiles(backend, dir.path(), {{QStringLiteral("base.txt"), "base\n"}},
+                                 QStringLiteral("base"), &base, &error), qPrintable(error));
+            const QString mainBranch = backend.snapshot(&error).headName;
+            QVERIFY2(backend.createBranch(QStringLiteral("feature"), {}, &error), qPrintable(error));
+            QString feature;
+            QVERIFY2(commitFiles(backend, dir.path(), {{QStringLiteral("feature.txt"), "feature\n"}},
+                                 QStringLiteral("feature"), &feature, &error), qPrintable(error));
+            QVERIFY2(backend.checkoutBranch(mainBranch, &error), qPrintable(error));
+
+            git_repository* repo = nullptr;
+            git_transaction* blocker = nullptr;
+            git_reference* head = nullptr;
+            QVERIFY2(checkGit(git_repository_open(&repo, dir.path().toUtf8().constData()),
+                              QStringLiteral("Cannot open repository"), &error),
+                     qPrintable(error));
+            QVERIFY2(checkGit(git_repository_head(&head, repo),
+                              QStringLiteral("Cannot resolve HEAD"), &error),
+                     qPrintable(error));
+            QVERIFY2(checkGit(git_transaction_new(&blocker, repo),
+                              QStringLiteral("Cannot create blocking transaction"), &error),
+                     qPrintable(error));
+            QVERIFY2(checkGit(git_transaction_lock_ref(blocker, git_reference_name(head)),
+                              QStringLiteral("Cannot lock current branch"), &error),
+                     qPrintable(error));
+
+            const auto blocked = backend.mergeRevision(QStringLiteral("feature"), &error);
+            Q_UNUSED(blocked)
+            QVERIFY(!error.isEmpty());
+            const Git::RepositoryState blockedState = backend.snapshot(nullptr);
+            QCOMPARE(blockedState.headHash, base);
+            QVERIFY(!QFileInfo::exists(dir.filePath(QStringLiteral("feature.txt"))));
+
+            git_reference_free(head);
+            git_transaction_free(blocker);
+            git_repository_free(repo);
+            error.clear();
+
+            const auto merged = backend.mergeRevision(QStringLiteral("feature"), &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(merged.status, Git::HistoryOperationStatus::Completed);
+            QCOMPARE(backend.snapshot(&error).headHash, feature);
+            QVERIFY(QFileInfo::exists(dir.filePath(QStringLiteral("feature.txt"))));
+        }
+    }
+
+    void rebasePlanExecutesAndRejectsStaleHead()
+    {
+        QTemporaryDir dir; QVERIFY(dir.isValid());
+        Git::LibGit2Backend backend; QString error;
+        QVERIFY2(initializeConfigured(backend, dir.path(), &error), qPrintable(error));
+        QVERIFY(commitFiles(backend, dir.path(), {{QStringLiteral("base.txt"), "base\n"}},
+                            QStringLiteral("base"), nullptr, &error));
+        const QString mainBranch = backend.snapshot(&error).headName;
+        QVERIFY(backend.createBranch(QStringLiteral("feature"), {}, &error));
+        QVERIFY(commitFiles(backend, dir.path(), {{QStringLiteral("feature.txt"), "feature\n"}},
+                            QStringLiteral("feature"), nullptr, &error));
+        QVERIFY(backend.checkoutBranch(mainBranch, &error));
+        QString mainHead;
+        QVERIFY(commitFiles(backend, dir.path(), {{QStringLiteral("main.txt"), "main\n"}},
+                            QStringLiteral("main"), &mainHead, &error));
+        QVERIFY(backend.checkoutBranch(QStringLiteral("feature"), &error));
+
+        Git::RebasePlan stale = backend.rebasePlan(mainHead, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(stale.items.size(), 1);
+        QVERIFY(commitFiles(backend, dir.path(), {{QStringLiteral("later.txt"), "later\n"}},
+                            QStringLiteral("later"), nullptr, &error));
+        auto result = backend.rebaseOnto(stale, false, &error);
+        QVERIFY(!error.isEmpty());
+
+        error.clear();
+        Git::RebasePlan current = backend.rebasePlan(mainHead, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(current.items.size(), 2);
+        result = backend.rebaseOnto(current, false, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(result.status, Git::HistoryOperationStatus::Completed);
+        QVERIFY2(descendantOf(dir.path(), backend.snapshot(&error).headHash, mainHead, &error),
+                 qPrintable(error));
+    }
+
+    void normalRebaseRemovesLegacyInteractiveState()
+    {
+        QTemporaryDir dir; QVERIFY(dir.isValid());
+        Git::LibGit2Backend backend; QString error;
+        QVERIFY2(initializeConfigured(backend, dir.path(), &error), qPrintable(error));
+        QVERIFY(commitFiles(backend, dir.path(),
+                            {{QStringLiteral("base.txt"), "base\n"}},
+                            QStringLiteral("base"), nullptr, &error));
+        const QString mainBranch = backend.snapshot(&error).headName;
+        QVERIFY(backend.createBranch(QStringLiteral("feature"), {}, &error));
+        QVERIFY(commitFiles(backend, dir.path(),
+                            {{QStringLiteral("feature.txt"), "feature\n"}},
+                            QStringLiteral("feature"), nullptr, &error));
+        QVERIFY(backend.checkoutBranch(mainBranch, &error));
+        QString mainHead;
+        QVERIFY(commitFiles(backend, dir.path(),
+                            {{QStringLiteral("main.txt"), "main\n"}},
+                            QStringLiteral("main"), &mainHead, &error));
+        QVERIFY(backend.checkoutBranch(QStringLiteral("feature"), &error));
+        const Git::RebasePlan plan = backend.rebasePlan(mainHead, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+
+        const QString legacySidecar =
+            dir.filePath(QStringLiteral(".git/gitmanager-rebase.json"));
+        QFile stale(legacySidecar);
+        QVERIFY(stale.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(stale.write("{\"version\":1,\"stale\":true}"), qint64(26));
+        stale.close();
+
+        const auto result = backend.rebaseOnto(plan, false, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(result.status, Git::HistoryOperationStatus::Completed);
+        QVERIFY(!QFileInfo::exists(legacySidecar));
+        QVERIFY2(descendantOf(dir.path(), backend.snapshot(&error).headHash,
+                              mainHead, &error), qPrintable(error));
+    }
+
+    void cherryPickAndRevertSupportMainline()
+    {
+        QTemporaryDir dir; QVERIFY(dir.isValid());
+        Git::LibGit2Backend backend; QString error;
+        QVERIFY2(initializeConfigured(backend, dir.path(), &error), qPrintable(error));
+        QVERIFY(commitFiles(backend, dir.path(), {{QStringLiteral("base.txt"), "base\n"}},
+                            QStringLiteral("base"), nullptr, &error));
+        const QString mainBranch = backend.snapshot(&error).headName;
+        QVERIFY(backend.createBranch(QStringLiteral("feature"), {}, &error));
+        QString featureHead;
+        QVERIFY(commitFiles(backend, dir.path(), {{QStringLiteral("feature.txt"), "feature\n"}},
+                            QStringLiteral("feature"), &featureHead, &error));
+        QVERIFY(backend.checkoutBranch(mainBranch, &error));
+        QString mainBeforeMerge;
+        QVERIFY(commitFiles(backend, dir.path(), {{QStringLiteral("main.txt"), "main\n"}},
+                            QStringLiteral("main"), &mainBeforeMerge, &error));
+        auto result = backend.mergeRevision(QStringLiteral("feature"), &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        const QString mergeCommit = backend.snapshot(&error).headHash;
+        QCOMPARE(commitParentCount(dir.path(), mergeCommit, &error), 2);
+
+        QVERIFY2(backend.createBranch(QStringLiteral("target"), mainBeforeMerge, &error),
+                 qPrintable(error));
+        result = backend.cherryPickCommit(mergeCommit, 0, &error);
+        QVERIFY(!error.isEmpty());
+        QCOMPARE(backend.snapshot(nullptr).activeOperation, Git::RepositoryOperation::None);
+
+        error.clear();
+        result = backend.cherryPickCommit(mergeCommit, 1, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(result.status, Git::HistoryOperationStatus::Completed);
+        QVERIFY(QFileInfo::exists(dir.filePath(QStringLiteral("feature.txt"))));
+        result = backend.revertCommit(mergeCommit, 1, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(result.status, Git::HistoryOperationStatus::Completed);
+        QVERIFY(!QFileInfo::exists(dir.filePath(QStringLiteral("feature.txt"))));
+
+        QVERIFY2(backend.createBranch(QStringLiteral("target-mainline-2"),
+                                      featureHead, &error), qPrintable(error));
+        result = backend.cherryPickCommit(mergeCommit, 2, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(result.status, Git::HistoryOperationStatus::Completed);
+        QVERIFY(QFileInfo::exists(dir.filePath(QStringLiteral("main.txt"))));
+        result = backend.revertCommit(mergeCommit, 2, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(result.status, Git::HistoryOperationStatus::Completed);
+        QVERIFY(!QFileInfo::exists(dir.filePath(QStringLiteral("main.txt"))));
+    }
+
+    void cherryPickAndRevertConflictsCanContinueOrAbort()
+    {
+        const auto prepareConflict = [](QTemporaryDir& dir,
+                                        Git::LibGit2Backend& backend,
+                                        QString* sourceHead,
+                                        QString* targetHead,
+                                        QString* error) {
+            if (!initializeConfigured(backend, dir.path(), error)
+                || !commitFiles(backend, dir.path(),
+                                {{QStringLiteral("conflict.txt"), "base\n"}},
+                                QStringLiteral("base"), nullptr, error)) {
+                return false;
+            }
+            const QString mainBranch = backend.snapshot(error).headName;
+            return backend.createBranch(QStringLiteral("source"), {}, error)
+                && commitFiles(backend, dir.path(),
+                               {{QStringLiteral("conflict.txt"), "source\n"}},
+                               QStringLiteral("source"), sourceHead, error)
+                && backend.checkoutBranch(mainBranch, error)
+                && commitFiles(backend, dir.path(),
+                               {{QStringLiteral("conflict.txt"), "target\n"}},
+                               QStringLiteral("target"), targetHead, error);
+        };
+
+        {
+            QTemporaryDir dir; QVERIFY(dir.isValid());
+            Git::LibGit2Backend backend; QString error, sourceHead, targetHead;
+            QVERIFY2(prepareConflict(dir, backend, &sourceHead, &targetHead,
+                                     &error), qPrintable(error));
+
+            auto result = backend.cherryPickCommit(sourceHead, 0, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(result.status, Git::HistoryOperationStatus::Conflicts);
+            QCOMPARE(backend.snapshot(&error).activeOperation,
+                     Git::RepositoryOperation::CherryPick);
+            QVERIFY2(backend.resolveConflict(QStringLiteral("conflict.txt"),
+                                             false, &error), qPrintable(error));
+            result = backend.continueHistoryOperation(
+                QStringLiteral("cherry-pick"), &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(result.status, Git::HistoryOperationStatus::Completed);
+            const Git::RepositoryState state = backend.snapshot(&error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(state.activeOperation, Git::RepositoryOperation::None);
+            QVERIFY(state.headHash != targetHead);
+            QCOMPARE(fileContents(dir.path(), QStringLiteral("conflict.txt")),
+                     QByteArray("source\n"));
+        }
+
+        {
+            QTemporaryDir dir; QVERIFY(dir.isValid());
+            Git::LibGit2Backend backend; QString error, sourceHead, targetHead;
+            QVERIFY2(prepareConflict(dir, backend, &sourceHead, &targetHead,
+                                     &error), qPrintable(error));
+
+            const auto result = backend.cherryPickCommit(sourceHead, 0, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(result.status, Git::HistoryOperationStatus::Conflicts);
+            QVERIFY2(backend.abortOperation(QStringLiteral("cherry-pick"),
+                                            &error), qPrintable(error));
+            const Git::RepositoryState state = backend.snapshot(&error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(state.activeOperation, Git::RepositoryOperation::None);
+            QCOMPARE(state.headHash, targetHead);
+            QCOMPARE(fileContents(dir.path(), QStringLiteral("conflict.txt")),
+                     QByteArray("target\n"));
+        }
+
+        {
+            QTemporaryDir dir; QVERIFY(dir.isValid());
+            Git::LibGit2Backend backend; QString error, sourceHead, targetHead;
+            QVERIFY2(prepareConflict(dir, backend, &sourceHead, &targetHead,
+                                     &error), qPrintable(error));
+
+            auto result = backend.revertCommit(sourceHead, 0, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(result.status, Git::HistoryOperationStatus::Conflicts);
+            QCOMPARE(backend.snapshot(&error).activeOperation,
+                     Git::RepositoryOperation::Revert);
+            QVERIFY2(backend.resolveConflict(QStringLiteral("conflict.txt"),
+                                             false, &error), qPrintable(error));
+            result = backend.continueHistoryOperation(QStringLiteral("revert"),
+                                                      &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(result.status, Git::HistoryOperationStatus::Completed);
+            const Git::RepositoryState state = backend.snapshot(&error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(state.activeOperation, Git::RepositoryOperation::None);
+            QVERIFY(state.headHash != targetHead);
+            QCOMPARE(fileContents(dir.path(), QStringLiteral("conflict.txt")),
+                     QByteArray("base\n"));
+        }
+
+        {
+            QTemporaryDir dir; QVERIFY(dir.isValid());
+            Git::LibGit2Backend backend; QString error, sourceHead, targetHead;
+            QVERIFY2(prepareConflict(dir, backend, &sourceHead, &targetHead,
+                                     &error), qPrintable(error));
+
+            const auto result = backend.revertCommit(sourceHead, 0, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(result.status, Git::HistoryOperationStatus::Conflicts);
+            QVERIFY2(backend.abortOperation(QStringLiteral("revert"), &error),
+                     qPrintable(error));
+            const Git::RepositoryState state = backend.snapshot(&error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(state.activeOperation, Git::RepositoryOperation::None);
+            QCOMPARE(state.headHash, targetHead);
+            QCOMPARE(fileContents(dir.path(), QStringLiteral("conflict.txt")),
+                     QByteArray("target\n"));
+        }
+    }
+
+    void resetModesPreserveTheirDocumentedLayers()
+    {
+        const auto runReset = [](Git::ResetMode mode) {
+            QTemporaryDir dir; QVERIFY(dir.isValid());
+            Git::LibGit2Backend backend; QString error;
+            QVERIFY2(initializeConfigured(backend, dir.path(), &error), qPrintable(error));
+            QString base;
+            QVERIFY(commitFiles(backend, dir.path(), {{QStringLiteral("value.txt"), "base\n"}},
+                                QStringLiteral("base"), &base, &error));
+            QVERIFY(commitFiles(backend, dir.path(), {{QStringLiteral("value.txt"), "second\n"}},
+                                QStringLiteral("second"), nullptr, &error));
+            const Git::HistoryRewritePreview preview = backend.resetPreview(base, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(preview.affectedCount, 1);
+            QCOMPARE(preview.publishedCount, 0);
+            const auto result = backend.resetToCommit(preview, mode, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(result.status, Git::HistoryOperationStatus::Completed);
+            const Git::RepositoryState state = backend.snapshot(&error);
+            QCOMPARE(state.headHash, base);
+            if (mode == Git::ResetMode::Soft) {
+                QCOMPARE(fileContents(dir.path(), QStringLiteral("value.txt")), QByteArray("second\n"));
+                QCOMPARE(state.files.size(), 1);
+                QVERIFY(state.files.first().isStaged());
+            } else if (mode == Git::ResetMode::Mixed) {
+                QCOMPARE(fileContents(dir.path(), QStringLiteral("value.txt")), QByteArray("second\n"));
+                QCOMPARE(state.files.size(), 1);
+                QVERIFY(!state.files.first().isStaged());
+                QVERIFY(state.files.first().isUnstaged());
+            } else {
+                QCOMPARE(fileContents(dir.path(), QStringLiteral("value.txt")), QByteArray("base\n"));
+                QVERIFY(state.files.isEmpty());
+            }
+        };
+
+        runReset(Git::ResetMode::Soft);
+        runReset(Git::ResetMode::Mixed);
+        runReset(Git::ResetMode::Hard);
+    }
+
+    void resetPreviewDetectsPublishedCommits()
+    {
+        QTemporaryDir dir; QVERIFY(dir.isValid());
+        Git::LibGit2Backend backend; QString error;
+        QVERIFY2(initializeConfigured(backend, dir.path(), &error), qPrintable(error));
+        QString base;
+        QString published;
+        QVERIFY2(commitFiles(backend, dir.path(),
+                             {{QStringLiteral("value.txt"), "base\n"}},
+                             QStringLiteral("base"), &base, &error),
+                 qPrintable(error));
+        QVERIFY2(commitFiles(backend, dir.path(),
+                             {{QStringLiteral("value.txt"), "published\n"}},
+                             QStringLiteral("published"), &published, &error),
+                 qPrintable(error));
+
+        QVERIFY2(createDirectReference(dir.path(), "refs/remotes/origin/main",
+                                       published, &error), qPrintable(error));
+
+        const Git::HistoryRewritePreview preview = backend.resetPreview(base, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(preview.affectedCount, 1);
+        QCOMPARE(preview.publishedCount, 1);
+    }
+
+    void resetPreviewRejectsBranchIdentityChanges()
+    {
+        QTemporaryDir dir; QVERIFY(dir.isValid());
+        Git::LibGit2Backend backend; QString error;
+        QVERIFY2(initializeConfigured(backend, dir.path(), &error), qPrintable(error));
+        const QString initialBranch = backend.snapshot(&error).headName;
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QString sharedHead;
+        QVERIFY2(commitFiles(backend, dir.path(),
+                             {{QStringLiteral("value.txt"), "base\n"}},
+                             QStringLiteral("base"), &sharedHead, &error),
+                 qPrintable(error));
+        QVERIFY2(createDirectReference(dir.path(), "refs/heads/other", sharedHead, &error),
+                 qPrintable(error));
+
+        const Git::HistoryRewritePreview preview =
+            backend.resetPreview(QStringLiteral("HEAD~0"), &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(preview.currentBranch, initialBranch);
+
+        QVERIFY2(setHeadRef(dir.path(), "refs/heads/other", &error), qPrintable(error));
+        const Git::RepositoryState before = backend.snapshot(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        const auto result = backend.resetToCommit(preview, Git::ResetMode::Soft, &error);
+        Q_UNUSED(result)
+        QVERIFY(!error.isEmpty());
+        const Git::RepositoryState after = backend.snapshot(nullptr);
+        QCOMPARE(after.headHash, before.headHash);
+        QCOMPARE(after.headName, QStringLiteral("other"));
+        QCOMPARE(fileContents(dir.path(), QStringLiteral("value.txt")),
+                 QByteArray("base\n"));
+    }
+
+    void rebasePlanRejectsBranchIdentityChanges()
+    {
+        QTemporaryDir dir; QVERIFY(dir.isValid());
+        Git::LibGit2Backend backend; QString error;
+        QVERIFY2(initializeConfigured(backend, dir.path(), &error), qPrintable(error));
+        QVERIFY2(commitFiles(backend, dir.path(),
+                             {{QStringLiteral("base.txt"), "base\n"}},
+                             QStringLiteral("base"), nullptr, &error),
+                 qPrintable(error));
+        const QString mainBranch = backend.snapshot(&error).headName;
+        QVERIFY2(backend.createBranch(QStringLiteral("feature"), {}, &error),
+                 qPrintable(error));
+        QVERIFY2(commitFiles(backend, dir.path(),
+                             {{QStringLiteral("feature.txt"), "feature\n"}},
+                             QStringLiteral("feature"), nullptr, &error),
+                 qPrintable(error));
+        const QString featureHead = backend.snapshot(&error).headHash;
+        QVERIFY2(createDirectReference(dir.path(), "refs/heads/other", featureHead, &error),
+                 qPrintable(error));
+        QVERIFY2(backend.checkoutBranch(mainBranch, &error), qPrintable(error));
+        QString mainHead;
+        QVERIFY2(commitFiles(backend, dir.path(),
+                             {{QStringLiteral("main.txt"), "main\n"}},
+                             QStringLiteral("main"), &mainHead, &error),
+                 qPrintable(error));
+        QVERIFY2(backend.checkoutBranch(QStringLiteral("feature"), &error),
+                 qPrintable(error));
+
+        const Git::RebasePlan plan = backend.rebasePlan(mainHead, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(plan.preview.currentBranch, QStringLiteral("feature"));
+
+        QVERIFY2(setHeadRef(dir.path(), "refs/heads/other", &error), qPrintable(error));
+        const auto result = backend.rebaseOnto(plan, false, &error);
+        Q_UNUSED(result)
+        QVERIFY(!error.isEmpty());
+        const Git::RepositoryState state = backend.snapshot(nullptr);
+        QCOMPARE(state.headName, QStringLiteral("other"));
+        QCOMPARE(state.headHash, featureHead);
+        QCOMPARE(state.activeOperation, Git::RepositoryOperation::None);
+    }
+
+    void multiCommitSequencerStateIsRejectedSafely()
+    {
+        const auto run = [](const QString& headFile,
+                            const QString& operationName) {
+            QTemporaryDir dir; QVERIFY(dir.isValid());
+            Git::LibGit2Backend backend; QString error;
+            QVERIFY2(initializeConfigured(backend, dir.path(), &error),
+                     qPrintable(error));
+            QString headHash;
+            QVERIFY2(commitFiles(backend, dir.path(),
+                                 {{QStringLiteral("value.txt"), "base\n"}},
+                                 QStringLiteral("base"), &headHash, &error),
+                     qPrintable(error));
+            QVERIFY2(writeRepositoryStateFile(
+                         dir.path(),
+                         QStringLiteral(".git/%1").arg(headFile),
+                         headHash.toUtf8() + '\n', &error),
+                     qPrintable(error));
+            QVERIFY2(writeRepositoryStateFile(
+                         dir.path(),
+                         QStringLiteral(".git/sequencer/todo"),
+                         QByteArray("pick ") + headHash.toUtf8()
+                             + QByteArray(" sample\n"),
+                         &error),
+                     qPrintable(error));
+
+            const Git::RepositoryState snapshot = backend.snapshot(&error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(snapshot.activeOperation, Git::RepositoryOperation::Unknown);
+            QCOMPARE(snapshot.headHash, headHash);
+
+            QByteArray todoBefore = fileContents(
+                dir.path(), QStringLiteral(".git/sequencer/todo"));
+            QVERIFY(!backend.continueOperation(operationName, &error));
+            QVERIFY(!error.isEmpty());
+            error.clear();
+            QVERIFY(!backend.abortOperation(operationName, &error));
+            QVERIFY(!error.isEmpty());
+
+            const Git::RepositoryState after = backend.snapshot(nullptr);
+            QCOMPARE(after.activeOperation, Git::RepositoryOperation::Unknown);
+            QCOMPARE(after.headHash, headHash);
+            QCOMPARE(fileContents(dir.path(), QStringLiteral(".git/sequencer/todo")),
+                     todoBefore);
+        };
+
+        run(QStringLiteral("CHERRY_PICK_HEAD"), QStringLiteral("cherry-pick"));
+        run(QStringLiteral("REVERT_HEAD"), QStringLiteral("revert"));
+    }
+
+    void interactiveRebaseSupportsAllActionsAndSidecarRecovery()
+    {
+        QTemporaryDir dir; QVERIFY(dir.isValid());
+        Git::LibGit2Backend backend; QString error;
+        QVERIFY2(initializeConfigured(backend, dir.path(), &error), qPrintable(error));
+        QVERIFY(commitFiles(backend, dir.path(), {{QStringLiteral("base.txt"), "base\n"}},
+                            QStringLiteral("base"), nullptr, &error));
+        const QString mainBranch = backend.snapshot(&error).headName;
+        QVERIFY(backend.createBranch(QStringLiteral("feature"), {}, &error));
+        for (int index = 1; index <= 6; ++index) {
+            const QString path = QStringLiteral("item%1.txt").arg(index);
+            const QString subject = QStringLiteral("item-%1").arg(index);
+            QVERIFY2(commitFiles(backend, dir.path(), {{path, subject.toUtf8() + '\n'}},
+                                 subject, nullptr, &error), qPrintable(error));
+        }
+        QVERIFY(backend.checkoutBranch(mainBranch, &error));
+        QString mainHead;
+        QVERIFY(commitFiles(backend, dir.path(), {{QStringLiteral("upstream.txt"), "upstream\n"}},
+                            QStringLiteral("upstream"), &mainHead, &error));
+        QVERIFY(backend.checkoutBranch(QStringLiteral("feature"), &error));
+        QVERIFY2(setConfigString(dir.path(), "notes.rewrite.rebase", "true", &error),
+                 qPrintable(error));
+        QVERIFY2(setConfigString(dir.path(), "notes.rewriteref",
+                                 "refs/notes/commits", &error),
+                 qPrintable(error));
+
+        Git::RebasePlan plan = backend.rebasePlan(mainHead, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(plan.items.size(), 6);
+        for (Git::RebasePlanItem& item : plan.items) {
+            if (item.subject == QStringLiteral("item-1"))
+                item.action = Git::RebaseAction::Pick;
+            else if (item.subject == QStringLiteral("item-2")) {
+                item.action = Git::RebaseAction::Reword;
+                item.rewrittenMessage = QStringLiteral("item-two-reworded\n");
+            } else if (item.subject == QStringLiteral("item-3"))
+                item.action = Git::RebaseAction::Edit;
+            else if (item.subject == QStringLiteral("item-4"))
+                item.action = Git::RebaseAction::Squash;
+            else if (item.subject == QStringLiteral("item-5"))
+                item.action = Git::RebaseAction::Fixup;
+            else if (item.subject == QStringLiteral("item-6"))
+                item.action = Git::RebaseAction::Drop;
+        }
+
+        auto result = backend.rebaseOnto(plan, true, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(result.status, Git::HistoryOperationStatus::PausedForEdit);
+        QCOMPARE(backend.snapshot(&error).activeOperation, Git::RepositoryOperation::Rebase);
+        const QString sidecar = dir.filePath(
+            QStringLiteral(".git/rebase-merge/gitmanager.json"));
+        QVERIFY(QFileInfo::exists(sidecar));
+
+        backend.close();
+        Git::LibGit2Backend reopened;
+        QVERIFY2(reopened.open(dir.path(), &error), qPrintable(error));
+        result = reopened.continueHistoryOperation(QStringLiteral("rebase"), &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(result.status, Git::HistoryOperationStatus::Completed);
+        QVERIFY(!QFileInfo::exists(sidecar));
+        QCOMPARE(reopened.snapshot(&error).activeOperation, Git::RepositoryOperation::None);
+        QVERIFY(QFileInfo::exists(dir.filePath(QStringLiteral("item4.txt"))));
+        QVERIFY(QFileInfo::exists(dir.filePath(QStringLiteral("item5.txt"))));
+        QVERIFY(!QFileInfo::exists(dir.filePath(QStringLiteral("item6.txt"))));
+
+        Git::CommitHistoryQuery query;
+        query.limit = 20;
+        const auto history = reopened.commitHistory(query, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(history.commits.size(), 5);
+        QStringList subjects;
+        for (const Git::Commit& commit : history.commits)
+            subjects.append(commit.subject);
+        QVERIFY(subjects.contains(QStringLiteral("item-1")));
+        QVERIFY(subjects.contains(QStringLiteral("item-two-reworded")));
+        QVERIFY(subjects.contains(QStringLiteral("item-3")));
+        QVERIFY(!subjects.contains(QStringLiteral("item-4")));
+        QVERIFY(!subjects.contains(QStringLiteral("item-5")));
+        QVERIFY(!subjects.contains(QStringLiteral("item-6")));
+    }
+
+    void interactiveRebaseRejectsForeignAndInvalidSidecars()
+    {
+        const auto startPaused = [](QTemporaryDir& dir,
+                                    Git::LibGit2Backend& backend,
+                                    QString* sidecar, QString* error) {
+            if (!initializeConfigured(backend, dir.path(), error)
+                || !commitFiles(backend, dir.path(),
+                                {{QStringLiteral("base.txt"), "base\n"}},
+                                QStringLiteral("base"), nullptr, error)) {
+                return false;
+            }
+            const QString mainBranch = backend.snapshot(error).headName;
+            if (!backend.createBranch(QStringLiteral("feature"), {}, error)
+                || !commitFiles(backend, dir.path(),
+                                {{QStringLiteral("feature.txt"), "feature\n"}},
+                                QStringLiteral("feature"), nullptr, error)
+                || !backend.checkoutBranch(mainBranch, error)) {
+                return false;
+            }
+            QString mainHead;
+            if (!commitFiles(backend, dir.path(),
+                             {{QStringLiteral("main.txt"), "main\n"}},
+                             QStringLiteral("main"), &mainHead, error)
+                || !backend.checkoutBranch(QStringLiteral("feature"), error)) {
+                return false;
+            }
+            Git::RebasePlan plan = backend.rebasePlan(mainHead, error);
+            if ((error && !error->isEmpty()) || plan.items.size() != 1)
+                return false;
+            plan.items[0].action = Git::RebaseAction::Edit;
+            const auto result = backend.rebaseOnto(plan, true, error);
+            if ((error && !error->isEmpty())
+                || result.status != Git::HistoryOperationStatus::PausedForEdit) {
+                return false;
+            }
+            *sidecar = dir.filePath(
+                QStringLiteral(".git/rebase-merge/gitmanager.json"));
+            return QFileInfo::exists(*sidecar);
+        };
+
+        {
+            QTemporaryDir dir; QVERIFY(dir.isValid());
+            Git::LibGit2Backend backend; QString error, sidecar;
+            QVERIFY2(startPaused(dir, backend, &sidecar, &error), qPrintable(error));
+            QFile input(sidecar);
+            QVERIFY(input.open(QIODevice::ReadOnly));
+            QJsonDocument document = QJsonDocument::fromJson(input.readAll());
+            input.close();
+            QJsonObject root = document.object();
+            QJsonObject preview = root.value(QStringLiteral("preview")).toObject();
+            preview.insert(QStringLiteral("targetHash"),
+                           preview.value(QStringLiteral("expectedHead")));
+            root.insert(QStringLiteral("preview"), preview);
+            QFile output(sidecar);
+            QVERIFY(output.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QVERIFY(output.write(QJsonDocument(root).toJson(QJsonDocument::Compact)) > 0);
+            output.close();
+
+            backend.close();
+            Git::LibGit2Backend reopened;
+            QVERIFY2(reopened.open(dir.path(), &error), qPrintable(error));
+            error.clear();
+            const auto result = reopened.continueHistoryOperation(
+                QStringLiteral("rebase"), &error);
+            Q_UNUSED(result)
+            QVERIFY(error.contains(QStringLiteral("different rebase session")));
+            QCOMPARE(reopened.snapshot(nullptr).activeOperation,
+                     Git::RepositoryOperation::Rebase);
+            error.clear();
+            QVERIFY2(reopened.abortOperation(QStringLiteral("rebase"), &error),
+                     qPrintable(error));
+        }
+
+        {
+            QTemporaryDir dir; QVERIFY(dir.isValid());
+            Git::LibGit2Backend backend; QString error, sidecar;
+            QVERIFY2(startPaused(dir, backend, &sidecar, &error), qPrintable(error));
+            QFile input(sidecar);
+            QVERIFY(input.open(QIODevice::ReadOnly));
+            QJsonDocument document = QJsonDocument::fromJson(input.readAll());
+            input.close();
+            QJsonObject root = document.object();
+            QJsonArray items = root.value(QStringLiteral("items")).toArray();
+            QJsonObject first = items.at(0).toObject();
+            first.insert(QStringLiteral("action"),
+                         static_cast<int>(Git::RebaseAction::Squash));
+            items.replace(0, first);
+            root.insert(QStringLiteral("items"), items);
+            QFile output(sidecar);
+            QVERIFY(output.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QVERIFY(output.write(QJsonDocument(root).toJson(QJsonDocument::Compact)) > 0);
+            output.close();
+
+            backend.close();
+            Git::LibGit2Backend reopened;
+            QVERIFY2(reopened.open(dir.path(), &error), qPrintable(error));
+            error.clear();
+            const auto result = reopened.continueHistoryOperation(
+                QStringLiteral("rebase"), &error);
+            Q_UNUSED(result)
+            QVERIFY(error.contains(QStringLiteral("invalid action"))
+                    || error.contains(QStringLiteral("edit state")));
+            QCOMPARE(reopened.snapshot(nullptr).activeOperation,
+                     Git::RepositoryOperation::Rebase);
+            error.clear();
+            QVERIFY2(reopened.abortOperation(QStringLiteral("rebase"), &error),
+                     qPrintable(error));
+        }
+    }
+
+    void interactiveRebaseRecoversPendingSquashWithoutDuplicatingMessage()
+    {
+        QTemporaryDir dir; QVERIFY(dir.isValid());
+        Git::LibGit2Backend backend; QString error;
+        QVERIFY2(initializeConfigured(backend, dir.path(), &error), qPrintable(error));
+        QVERIFY(commitFiles(backend, dir.path(),
+                            {{QStringLiteral("base.txt"), "base\n"}},
+                            QStringLiteral("base"), nullptr, &error));
+        const QString mainBranch = backend.snapshot(&error).headName;
+        QVERIFY(backend.createBranch(QStringLiteral("feature"), {}, &error));
+        QVERIFY(commitFiles(backend, dir.path(),
+                            {{QStringLiteral("first.txt"), "first\n"}},
+                            QStringLiteral("first-edit"), nullptr, &error));
+        QVERIFY(commitFiles(backend, dir.path(),
+                            {{QStringLiteral("second.txt"), "second\n"}},
+                            QStringLiteral("second-body"), nullptr, &error));
+        QVERIFY(backend.checkoutBranch(mainBranch, &error));
+        QString mainHead;
+        QVERIFY(commitFiles(backend, dir.path(),
+                            {{QStringLiteral("upstream.txt"), "upstream\n"}},
+                            QStringLiteral("upstream"), &mainHead, &error));
+        QVERIFY(backend.checkoutBranch(QStringLiteral("feature"), &error));
+
+        Git::RebasePlan plan = backend.rebasePlan(mainHead, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(plan.items.size(), 2);
+        plan.items[0].action = Git::RebaseAction::Edit;
+        plan.items[1].action = Git::RebaseAction::Squash;
+        plan.items[1].rewrittenMessage = QStringLiteral("second-body");
+        auto result = backend.rebaseOnto(plan, true, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(result.status, Git::HistoryOperationStatus::PausedForEdit);
+
+        const QString backupPath = dir.filePath(
+            QStringLiteral(".git/rebase-merge/gitmanager-rewritten"));
+        QVERIFY(QDir().mkpath(backupPath));
+        result = backend.continueHistoryOperation(QStringLiteral("rebase"), &error);
+        Q_UNUSED(result)
+        QVERIFY(error.contains(QStringLiteral("rewritten commit mapping")));
+        QCOMPARE(backend.snapshot(nullptr).activeOperation,
+                 Git::RepositoryOperation::Rebase);
+        const QString sidecar = dir.filePath(
+            QStringLiteral(".git/rebase-merge/gitmanager.json"));
+        QVERIFY(QFileInfo::exists(sidecar));
+
+        backend.close();
+        QVERIFY(QDir().rmdir(backupPath));
+        Git::LibGit2Backend reopened;
+        error.clear();
+        QVERIFY2(reopened.open(dir.path(), &error), qPrintable(error));
+        result = reopened.continueHistoryOperation(QStringLiteral("rebase"), &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(result.status, Git::HistoryOperationStatus::Completed);
+        QCOMPARE(reopened.snapshot(nullptr).activeOperation,
+                 Git::RepositoryOperation::None);
+        QVERIFY(!QFileInfo::exists(sidecar));
+
+        const QString message = commitMessage(
+            dir.path(), reopened.snapshot(&error).headHash, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY(message.startsWith(QStringLiteral("first-edit")));
+        QCOMPARE(message.count(QStringLiteral("second-body")), 1);
+    }
+
+    void interactiveRebasePrefersCompleteBackupOverValidPrimaryPrefix()
+    {
+        QTemporaryDir dir; QVERIFY(dir.isValid());
+        Git::LibGit2Backend backend; QString error;
+        QVERIFY2(initializeConfigured(backend, dir.path(), &error), qPrintable(error));
+        QVERIFY(commitFiles(backend, dir.path(),
+                            {{QStringLiteral("base.txt"), "base\n"}},
+                            QStringLiteral("base"), nullptr, &error));
+        const QString mainBranch = backend.snapshot(&error).headName;
+        QVERIFY(backend.createBranch(QStringLiteral("feature"), {}, &error));
+        QString firstHash;
+        QString notedHash;
+        QVERIFY(commitFiles(backend, dir.path(),
+                            {{QStringLiteral("first.txt"), "first\n"}},
+                            QStringLiteral("first"), &firstHash, &error));
+        QVERIFY(commitFiles(backend, dir.path(),
+                            {{QStringLiteral("noted.txt"), "noted\n"}},
+                            QStringLiteral("noted"), &notedHash, &error));
+        QVERIFY(commitFiles(backend, dir.path(),
+                            {{QStringLiteral("squash.txt"), "squash\n"}},
+                            QStringLiteral("squash"), nullptr, &error));
+        QVERIFY2(createNote(dir.path(), notedHash,
+                            QStringLiteral("note survives interrupted squash"),
+                            &error), qPrintable(error));
+
+        QVERIFY(backend.checkoutBranch(mainBranch, &error));
+        QString mainHead;
+        QVERIFY(commitFiles(backend, dir.path(),
+                            {{QStringLiteral("upstream.txt"), "upstream\n"}},
+                            QStringLiteral("upstream"), &mainHead, &error));
+        QVERIFY(backend.checkoutBranch(QStringLiteral("feature"), &error));
+        QVERIFY2(setConfigString(dir.path(), "notes.rewrite.rebase", "true", &error),
+                 qPrintable(error));
+        QVERIFY2(setConfigString(dir.path(), "notes.rewriteref",
+                                 "refs/notes/commits", &error),
+                 qPrintable(error));
+
+        Git::RebasePlan plan = backend.rebasePlan(mainHead, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(plan.items.size(), 3);
+        plan.items[1].action = Git::RebaseAction::Edit;
+        plan.items[2].action = Git::RebaseAction::Squash;
+        auto result = backend.rebaseOnto(plan, true, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(result.status, Git::HistoryOperationStatus::PausedForEdit);
+
+        const QString rebaseDir = dir.filePath(QStringLiteral(".git/rebase-merge"));
+        const QString sidecarPath = QDir(rebaseDir).filePath(
+            QStringLiteral("gitmanager.json"));
+        const QString primaryPath = QDir(rebaseDir).filePath(
+            QStringLiteral("rewritten"));
+        const QString backupPath = QDir(rebaseDir).filePath(
+            QStringLiteral("gitmanager-rewritten"));
+        QVERIFY(QDir().mkpath(backupPath));
+        result = backend.continueHistoryOperation(QStringLiteral("rebase"), &error);
+        Q_UNUSED(result)
+        QVERIFY(error.contains(QStringLiteral("rewritten commit mapping")));
+        QCOMPARE(backend.snapshot(nullptr).activeOperation,
+                 Git::RepositoryOperation::Rebase);
+        const QString rewrittenHead = backend.snapshot(nullptr).headHash;
+        QVERIFY(!rewrittenHead.isEmpty());
+
+        QFile sidecarFile(sidecarPath);
+        QVERIFY(sidecarFile.open(QIODevice::ReadOnly));
+        const QJsonObject sidecar = QJsonDocument::fromJson(
+            sidecarFile.readAll()).object();
+        sidecarFile.close();
+        const int pendingIndex = sidecar.value(QStringLiteral("pendingIndex")).toInt(-1);
+        QCOMPARE(pendingIndex, 2);
+        const QString preActionHead =
+            sidecar.value(QStringLiteral("preActionHead")).toString();
+        const QJsonArray items = sidecar.value(QStringLiteral("items")).toArray();
+        QCOMPARE(items.size(), 3);
+        const QString squashSource = items.at(pendingIndex).toObject()
+            .value(QStringLiteral("hash")).toString();
+        QVERIFY(!preActionHead.isEmpty());
+        QVERIFY(!squashSource.isEmpty());
+
+        QFile primaryInput(primaryPath);
+        QVERIFY(primaryInput.open(QIODevice::ReadOnly));
+        const QStringList primaryLines = QString::fromUtf8(primaryInput.readAll())
+            .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        primaryInput.close();
+        QCOMPARE(primaryLines.size(), 2);
+
+        QStringList completeLines;
+        QString prefixLine;
+        for (const QString& line : primaryLines) {
+            const int separator = line.indexOf(QLatin1Char(' '));
+            QVERIFY(separator > 0);
+            const QString source = line.left(separator);
+            QString target = line.mid(separator + 1).trimmed();
+            if (target.compare(preActionHead, Qt::CaseInsensitive) == 0)
+                target = rewrittenHead;
+            completeLines.append(source + QLatin1Char(' ') + target);
+            if (source.compare(firstHash, Qt::CaseInsensitive) == 0)
+                prefixLine = completeLines.constLast();
+        }
+        completeLines.append(squashSource + QLatin1Char(' ') + rewrittenHead);
+        QVERIFY(!prefixLine.isEmpty());
+        const QByteArray completeData =
+            (completeLines.join(QLatin1Char('\n')) + QLatin1Char('\n')).toUtf8();
+        const QByteArray prefixData = (prefixLine + QLatin1Char('\n')).toUtf8();
+
+        backend.close();
+        QVERIFY(QDir().rmdir(backupPath));
+        QFile backupOutput(backupPath);
+        QVERIFY(backupOutput.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(backupOutput.write(completeData), qint64(completeData.size()));
+        backupOutput.close();
+        QFile primaryOutput(primaryPath);
+        QVERIFY(primaryOutput.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(primaryOutput.write(prefixData), qint64(prefixData.size()));
+        primaryOutput.close();
+
+        Git::LibGit2Backend reopened;
+        error.clear();
+        QVERIFY2(reopened.open(dir.path(), &error), qPrintable(error));
+        result = reopened.continueHistoryOperation(QStringLiteral("rebase"), &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(result.status, Git::HistoryOperationStatus::Completed);
+        const Git::RepositoryState finalState = reopened.snapshot(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(finalState.activeOperation, Git::RepositoryOperation::None);
+        QVERIFY2(descendantOf(dir.path(), finalState.headHash, mainHead, &error),
+                 qPrintable(error));
+        error.clear();
+        QCOMPARE(noteMessage(dir.path(), finalState.headHash, &error),
+                 QStringLiteral("note survives interrupted squash"));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+    }
+
+    void interactiveRebaseAllowsEmptyFixupWithUnchangedHead()
+    {
+        QTemporaryDir dir; QVERIFY(dir.isValid());
+        Git::LibGit2Backend backend; QString error;
+        QVERIFY2(initializeConfigured(backend, dir.path(), &error), qPrintable(error));
+        QVERIFY(commitFiles(backend, dir.path(),
+                            {{QStringLiteral("base.txt"), "base\n"}},
+                            QStringLiteral("base"), nullptr, &error));
+        const QString mainBranch = backend.snapshot(&error).headName;
+        QVERIFY(backend.createBranch(QStringLiteral("feature"), {}, &error));
+        QVERIFY(commitFiles(backend, dir.path(),
+                            {{QStringLiteral("pause.txt"), "pause\n"}},
+                            QStringLiteral("pause"), nullptr, &error));
+        QVERIFY(commitFiles(backend, dir.path(),
+                            {{QStringLiteral("first.txt"), "first\n"}},
+                            QStringLiteral("first"), nullptr, &error));
+        QString emptyHash;
+        QVERIFY2(createEmptyCommit(dir.path(), QStringLiteral("empty-fixup"),
+                                   &emptyHash, &error), qPrintable(error));
+        QCOMPARE(backend.snapshot(&error).headHash, emptyHash);
+
+        QVERIFY(backend.checkoutBranch(mainBranch, &error));
+        QString mainHead;
+        QVERIFY(commitFiles(backend, dir.path(),
+                            {{QStringLiteral("upstream.txt"), "upstream\n"}},
+                            QStringLiteral("upstream"), &mainHead, &error));
+        QVERIFY(backend.checkoutBranch(QStringLiteral("feature"), &error));
+
+        Git::RebasePlan plan = backend.rebasePlan(mainHead, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(plan.items.size(), 3);
+        QCOMPARE(plan.items.at(2).hash, emptyHash);
+        plan.items[0].action = Git::RebaseAction::Edit;
+        plan.items[2].action = Git::RebaseAction::Fixup;
+        auto result = backend.rebaseOnto(plan, true, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(result.status, Git::HistoryOperationStatus::PausedForEdit);
+
+        const QString rebaseDir = dir.filePath(QStringLiteral(".git/rebase-merge"));
+        const QString sidecarPath = QDir(rebaseDir).filePath(
+            QStringLiteral("gitmanager.json"));
+        const QString backupPath = QDir(rebaseDir).filePath(
+            QStringLiteral("gitmanager-rewritten"));
+        QVERIFY(QDir().mkpath(backupPath));
+        result = backend.continueHistoryOperation(QStringLiteral("rebase"), &error);
+        Q_UNUSED(result)
+        QVERIFY(error.contains(QStringLiteral("rewritten commit mapping")));
+        const QString unchangedHead = backend.snapshot(nullptr).headHash;
+        QFile sidecarFile(sidecarPath);
+        QVERIFY(sidecarFile.open(QIODevice::ReadOnly));
+        const QJsonObject sidecar = QJsonDocument::fromJson(
+            sidecarFile.readAll()).object();
+        sidecarFile.close();
+        QCOMPARE(sidecar.value(QStringLiteral("pendingIndex")).toInt(-1), 2);
+        QCOMPARE(sidecar.value(QStringLiteral("preActionHead")).toString(),
+                 unchangedHead);
+
+        backend.close();
+        QVERIFY(QDir().rmdir(backupPath));
+        Git::LibGit2Backend reopened;
+        error.clear();
+        QVERIFY2(reopened.open(dir.path(), &error), qPrintable(error));
+        result = reopened.continueHistoryOperation(QStringLiteral("rebase"), &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(result.status, Git::HistoryOperationStatus::Completed);
+        const Git::RepositoryState state = reopened.snapshot(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(state.activeOperation, Git::RepositoryOperation::None);
+        QVERIFY2(descendantOf(dir.path(), state.headHash, mainHead, &error),
+                 qPrintable(error));
+
+        Git::CommitHistoryQuery query;
+        query.limit = 10;
+        const Git::CommitHistoryPage history = reopened.commitHistory(query, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(history.commits.size(), 4);
+        for (const Git::Commit& commit : history.commits)
+            QVERIFY(commit.hash != emptyHash);
+    }
+
+    void interactiveRebaseRejectsSquashAfterAlreadyAppliedPick()
+    {
+        const auto run = [](Git::RebaseAction action) {
+            QTemporaryDir dir; QVERIFY(dir.isValid());
+            Git::LibGit2Backend backend; QString error;
+            QVERIFY2(initializeConfigured(backend, dir.path(), &error),
+                     qPrintable(error));
+            QVERIFY(commitFiles(backend, dir.path(),
+                                {{QStringLiteral("base.txt"), "base\n"}},
+                                QStringLiteral("base"), nullptr, &error));
+            const QString mainBranch = backend.snapshot(&error).headName;
+            QVERIFY(backend.createBranch(QStringLiteral("feature"), {}, &error));
+            QVERIFY(commitFiles(backend, dir.path(),
+                                {{QStringLiteral("shared.txt"), "shared\n"}},
+                                QStringLiteral("feature-shared"), nullptr, &error));
+            QString featureHead;
+            QVERIFY(commitFiles(backend, dir.path(),
+                                {{QStringLiteral("second.txt"), "second\n"}},
+                                QStringLiteral("second"), &featureHead, &error));
+            QVERIFY(backend.checkoutBranch(mainBranch, &error));
+            QString mainHead;
+            QVERIFY(commitFiles(backend, dir.path(),
+                                {{QStringLiteral("shared.txt"), "shared\n"}},
+                                QStringLiteral("upstream-shared"), &mainHead, &error));
+            QVERIFY(backend.checkoutBranch(QStringLiteral("feature"), &error));
+
+            Git::RebasePlan plan = backend.rebasePlan(mainHead, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(plan.items.size(), 2);
+            plan.items[1].action = action;
+            const auto result = backend.rebaseOnto(plan, true, &error);
+            Q_UNUSED(result)
+            QVERIFY(error.contains(QStringLiteral("previous rewritten commit")));
+            QCOMPARE(backend.snapshot(nullptr).activeOperation,
+                     Git::RepositoryOperation::Rebase);
+            error.clear();
+            QVERIFY2(backend.abortOperation(QStringLiteral("rebase"), &error),
+                     qPrintable(error));
+            QCOMPARE(backend.snapshot(&error).headHash, featureHead);
+        };
+
+        run(Git::RebaseAction::Squash);
+        run(Git::RebaseAction::Fixup);
+    }
+
+    void interactiveRebaseConflictCanContinueOrAbortAfterReopen()
+    {
+        const auto prepareConflict = [](QTemporaryDir& dir,
+                                        Git::LibGit2Backend& backend,
+                                        QString* mainHead,
+                                        QString* featureHead,
+                                        QString* error) {
+            if (!initializeConfigured(backend, dir.path(), error)
+                || !commitFiles(backend, dir.path(),
+                                {{QStringLiteral("conflict.txt"), "base\n"}},
+                                QStringLiteral("base"), nullptr, error))
+                return false;
+            const QString mainBranch = backend.snapshot(error).headName;
+            return backend.createBranch(QStringLiteral("feature"), {}, error)
+                && commitFiles(backend, dir.path(),
+                               {{QStringLiteral("conflict.txt"), "feature\n"}},
+                               QStringLiteral("feature"), featureHead, error)
+                && backend.checkoutBranch(mainBranch, error)
+                && commitFiles(backend, dir.path(),
+                               {{QStringLiteral("conflict.txt"), "main\n"}},
+                               QStringLiteral("main"), mainHead, error)
+                && backend.checkoutBranch(QStringLiteral("feature"), error);
+        };
+
+        {
+            QTemporaryDir dir; QVERIFY(dir.isValid());
+            Git::LibGit2Backend backend; QString error, mainHead, featureHead;
+            QVERIFY2(prepareConflict(dir, backend, &mainHead, &featureHead, &error),
+                     qPrintable(error));
+            Git::RebasePlan plan = backend.rebasePlan(mainHead, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            auto result = backend.rebaseOnto(plan, true, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(result.status, Git::HistoryOperationStatus::Conflicts);
+            const Git::RepositoryState pausedState = backend.snapshot(&error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            error.clear();
+            QVERIFY(!backend.checkoutBranch(QStringLiteral("feature"), &error));
+            QVERIFY(!error.isEmpty());
+            error.clear();
+            QVERIFY(!backend.createBranch(QStringLiteral("forbidden"), mainHead,
+                                          &error));
+            QVERIFY(!error.isEmpty());
+            error.clear();
+            QVERIFY(!backend.deleteBranch(QStringLiteral("feature"), true,
+                                          &error));
+            QVERIFY(!error.isEmpty());
+            error.clear();
+            QVERIFY(!backend.createTag(QStringLiteral("forbidden-tag"), {}, {},
+                                       &error));
+            QVERIFY(!error.isEmpty());
+            const Git::RepositoryState guardedState = backend.snapshot(nullptr);
+            QCOMPARE(guardedState.headHash, pausedState.headHash);
+            QCOMPARE(guardedState.activeOperation, Git::RepositoryOperation::Rebase);
+            error.clear();
+            QVERIFY2(backend.resolveConflict(QStringLiteral("conflict.txt"), false, &error),
+                     qPrintable(error));
+            backend.close();
+
+            Git::LibGit2Backend reopened;
+            QVERIFY2(reopened.open(dir.path(), &error), qPrintable(error));
+            result = reopened.continueHistoryOperation(QStringLiteral("rebase"), &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(result.status, Git::HistoryOperationStatus::Completed);
+            QCOMPARE(fileContents(dir.path(), QStringLiteral("conflict.txt")), QByteArray("feature\n"));
+            QVERIFY2(descendantOf(dir.path(), reopened.snapshot(&error).headHash,
+                                  mainHead, &error), qPrintable(error));
+        }
+
+        {
+            QTemporaryDir dir; QVERIFY(dir.isValid());
+            Git::LibGit2Backend backend; QString error, mainHead, featureHead;
+            QVERIFY2(prepareConflict(dir, backend, &mainHead, &featureHead, &error),
+                     qPrintable(error));
+            const Git::RebasePlan plan = backend.rebasePlan(mainHead, &error);
+            const auto result = backend.rebaseOnto(plan, true, &error);
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(result.status, Git::HistoryOperationStatus::Conflicts);
+            backend.close();
+
+            Git::LibGit2Backend reopened;
+            QVERIFY2(reopened.open(dir.path(), &error), qPrintable(error));
+            QVERIFY2(reopened.abortOperation(QStringLiteral("rebase"), &error), qPrintable(error));
+            const Git::RepositoryState state = reopened.snapshot(&error);
+            QCOMPARE(state.headHash, featureHead);
+            QCOMPARE(state.activeOperation, Git::RepositoryOperation::None);
+            QCOMPARE(fileContents(dir.path(), QStringLiteral("conflict.txt")), QByteArray("feature\n"));
+            QVERIFY(!QFileInfo::exists(
+                dir.filePath(QStringLiteral(".git/rebase-merge/gitmanager.json"))));
+        }
     }
 
     void commitHistoryIsEmptyForUnbornRepository()

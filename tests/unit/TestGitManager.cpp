@@ -452,6 +452,223 @@ private slots:
         QCOMPARE(loadingSpy.last().at(0).toBool(), false);
     }
 
+    void cancelledRefreshRetriesAndPublishesState()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        QString error;
+        QVector<QString> hashes;
+        QVERIFY2(createRepository(directory.path(), 3,
+                                  QStringLiteral("refresh-cancel"), &hashes,
+                                  &error),
+                 qPrintable(error));
+
+        Git::GitManager manager;
+        QSignalSpy historySpy(&manager,
+                              &Git::GitManager::sigCommitHistoryReady);
+        manager.openRepository(directory.path());
+        QTRY_COMPARE_WITH_TIMEOUT(historySpy.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 15000);
+
+        QSignalSpy stateSpy(&manager, &Git::GitManager::sigStateReady);
+        QSignalSpy errorSpy(&manager, &Git::GitManager::sigError);
+        int refreshStarts = 0;
+        const QMetaObject::Connection connection = connect(
+            &manager, &Git::GitManager::sigCommandStarted, &manager,
+            [&](const QString& command) {
+                if (command != QStringLiteral("libgit2: refresh"))
+                    return;
+                ++refreshStarts;
+                if (refreshStarts == 1)
+                    manager.cancelAll();
+            });
+
+        manager.refresh();
+        QTRY_COMPARE_WITH_TIMEOUT(refreshStarts, 2, 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(stateSpy.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 15000);
+        disconnect(connection);
+
+        QCOMPARE(refreshStarts, 2);
+        QCOMPARE(qvariant_cast<Git::RepositoryState>(stateSpy.first().at(0)).headHash,
+                 hashes.last());
+        QCOMPARE(errorSpy.count(), 0);
+    }
+
+    void latestPreviewRequestWinsAcrossPreviewTypes()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        QString error;
+        QVector<QString> hashes;
+        QVERIFY2(createRepository(directory.path(), 4,
+                                  QStringLiteral("preview-latest"), &hashes,
+                                  &error),
+                 qPrintable(error));
+
+        Git::GitManager manager;
+        QSignalSpy historySpy(&manager,
+                              &Git::GitManager::sigCommitHistoryReady);
+        manager.openRepository(directory.path());
+        QTRY_COMPARE_WITH_TIMEOUT(historySpy.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 15000);
+
+        QSignalSpy resetPreviewSpy(&manager,
+                                   &Git::GitManager::sigResetPreviewReady);
+        QSignalSpy rebasePlanSpy(&manager,
+                                 &Git::GitManager::sigRebasePlanReady);
+        QSignalSpy errorSpy(&manager, &Git::GitManager::sigError);
+        int previewStarts = 0;
+        bool replaced = false;
+        const QMetaObject::Connection connection = connect(
+            &manager, &Git::GitManager::sigCommandStarted, &manager,
+            [&](const QString& command) {
+                if (!command.startsWith(QStringLiteral("libgit2: preview-")))
+                    return;
+                ++previewStarts;
+                if (replaced
+                    || command != QStringLiteral("libgit2: preview-reset")) {
+                    return;
+                }
+                replaced = true;
+                manager.requestRebasePlan(hashes.at(1));
+            });
+
+        manager.requestResetPreview(hashes.first());
+        QVERIFY(replaced);
+        QTRY_COMPARE_WITH_TIMEOUT(rebasePlanSpy.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 15000);
+        disconnect(connection);
+
+        QCOMPARE(previewStarts, 2);
+        QCOMPARE(resetPreviewSpy.count(), 0);
+        const Git::RebasePlan plan =
+            qvariant_cast<Git::RebasePlan>(rebasePlanSpy.first().at(0));
+        QCOMPARE(plan.preview.expectedHead, hashes.last());
+        QCOMPARE(plan.preview.targetHash, hashes.at(1));
+        QCOMPARE(plan.items.size(), 2);
+        QCOMPARE(errorSpy.count(), 0);
+    }
+
+    void repositorySwitchSuppressesPreviousPreview()
+    {
+        QTemporaryDir directoryA;
+        QTemporaryDir directoryB;
+        QVERIFY(directoryA.isValid());
+        QVERIFY(directoryB.isValid());
+        QString error;
+        QVector<QString> hashesA;
+        QVector<QString> hashesB;
+        QVERIFY2(createRepository(directoryA.path(), 4,
+                                  QStringLiteral("preview-repository-a"),
+                                  &hashesA, &error),
+                 qPrintable(error));
+        error.clear();
+        QVERIFY2(createRepository(directoryB.path(), 3,
+                                  QStringLiteral("preview-repository-b"),
+                                  &hashesB, &error),
+                 qPrintable(error));
+
+        Git::GitManager manager;
+        QSignalSpy historySpy(&manager,
+                              &Git::GitManager::sigCommitHistoryReady);
+        manager.openRepository(directoryA.path());
+        QTRY_COMPARE_WITH_TIMEOUT(historySpy.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 15000);
+        historySpy.clear();
+
+        QSignalSpy openedSpy(&manager, &Git::GitManager::sigRepositoryOpened);
+        QSignalSpy previewSpy(&manager,
+                              &Git::GitManager::sigResetPreviewReady);
+        QSignalSpy errorSpy(&manager, &Git::GitManager::sigError);
+        bool switched = false;
+        const QMetaObject::Connection connection = connect(
+            &manager, &Git::GitManager::sigCommandStarted, &manager,
+            [&](const QString& command) {
+                if (switched
+                    || command != QStringLiteral("libgit2: preview-reset")) {
+                    return;
+                }
+                switched = true;
+                manager.openRepository(directoryB.path());
+            });
+
+        manager.requestResetPreview(hashesA.first());
+        QVERIFY(switched);
+        QTRY_COMPARE_WITH_TIMEOUT(openedSpy.count(), 1, 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(historySpy.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 15000);
+        disconnect(connection);
+
+        QCOMPARE(QDir::cleanPath(manager.repositoryPath()),
+                 QDir::cleanPath(directoryB.path()));
+        QCOMPARE(previewSpy.count(), 0);
+
+        manager.requestResetPreview(hashesB.first());
+        QTRY_COMPARE_WITH_TIMEOUT(previewSpy.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 15000);
+        const Git::HistoryRewritePreview preview =
+            qvariant_cast<Git::HistoryRewritePreview>(previewSpy.first().at(0));
+        QCOMPARE(preview.expectedHead, hashesB.last());
+        QCOMPARE(preview.targetHash, hashesB.first());
+        QCOMPARE(errorSpy.count(), 0);
+    }
+
+    void previewsAndExecutesValidatedReset()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        QString error;
+        QVector<QString> hashes;
+        QVERIFY2(createRepository(directory.path(), 3, QStringLiteral("rewrite"),
+                                  &hashes, &error), qPrintable(error));
+
+        Git::GitManager manager;
+        QSignalSpy historySpy(&manager, &Git::GitManager::sigCommitHistoryReady);
+        QSignalSpy resetPreviewSpy(&manager,
+                                   &Git::GitManager::sigResetPreviewReady);
+        QSignalSpy rebasePlanSpy(&manager, &Git::GitManager::sigRebasePlanReady);
+        QSignalSpy operationSpy(&manager,
+                                &Git::GitManager::sigHistoryOperationFinished);
+        QSignalSpy stateSpy(&manager, &Git::GitManager::sigStateReady);
+        QSignalSpy errorSpy(&manager, &Git::GitManager::sigError);
+
+        manager.openRepository(directory.path());
+        QTRY_COMPARE_WITH_TIMEOUT(historySpy.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 15000);
+
+        manager.requestRebasePlan(hashes.first());
+        QTRY_COMPARE_WITH_TIMEOUT(rebasePlanSpy.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 15000);
+        const Git::RebasePlan plan =
+            qvariant_cast<Git::RebasePlan>(rebasePlanSpy.first().at(0));
+        QCOMPARE(plan.preview.expectedHead, hashes.last());
+        QCOMPARE(plan.preview.targetHash, hashes.first());
+        QCOMPARE(plan.items.size(), 2);
+
+        manager.requestResetPreview(hashes.first());
+        QTRY_COMPARE_WITH_TIMEOUT(resetPreviewSpy.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 15000);
+        const Git::HistoryRewritePreview preview =
+            qvariant_cast<Git::HistoryRewritePreview>(resetPreviewSpy.first().at(0));
+        QCOMPARE(preview.expectedHead, hashes.last());
+        QCOMPARE(preview.targetHash, hashes.first());
+        QCOMPARE(preview.affectedCount, 2);
+
+        stateSpy.clear();
+        manager.resetToCommit(preview, Git::ResetMode::Mixed);
+        QTRY_COMPARE_WITH_TIMEOUT(operationSpy.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!stateSpy.isEmpty(), 15000);
+        QCOMPARE(operationSpy.first().at(0).toString(), QStringLiteral("reset"));
+        QCOMPARE(qvariant_cast<Git::HistoryOperationStatus>(
+                     operationSpy.first().at(1)),
+                 Git::HistoryOperationStatus::Completed);
+        QCOMPARE(qvariant_cast<Git::RepositoryState>(stateSpy.last().at(0)).headHash,
+                 hashes.first());
+        QCOMPARE(errorSpy.count(), 0);
+    }
+
     void emptyRepositoryPublishesEmptyPage()
     {
         QTemporaryDir directory;

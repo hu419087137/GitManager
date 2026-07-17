@@ -26,6 +26,9 @@ GitManager::GitManager(QObject* parent)
     qRegisterMetaType<Commit>();
     qRegisterMetaType<CommitHistoryQuery>();
     qRegisterMetaType<CommitHistoryPage>();
+    qRegisterMetaType<HistoryRewritePreview>();
+    qRegisterMetaType<RebasePlan>();
+    qRegisterMetaType<HistoryOperationStatus>();
 }
 
 GitManager::~GitManager()
@@ -51,7 +54,8 @@ void GitManager::enqueue(const QString& operation,
                          bool requiresRepository,
                          bool reportCompletion,
                          bool refreshAfter,
-                         bool reportError)
+                         bool reportError,
+                         bool refreshOnCancel)
 {
     Task task;
     task.operation = operation;
@@ -64,6 +68,7 @@ void GitManager::enqueue(const QString& operation,
     task.reportCompletion = reportCompletion;
     task.refreshAfter = refreshAfter;
     task.reportError = reportError;
+    task.refreshOnCancel = refreshOnCancel;
     _tasks.enqueue(std::move(task));
     startNext();
 }
@@ -111,11 +116,13 @@ void GitManager::startNext()
                 if (task.refreshAfter)
                     refresh();
             }
-        } else if (cancelled && sameRepository && _isValid
-                   && task.reportCompletion) {
-            emit sigOperationFinished(task.operation, false,
-                                      QStringLiteral("操作已取消"));
-            refresh();
+        } else if (cancelled && sameRepository && _isValid) {
+            if (task.reportCompletion) {
+                emit sigOperationFinished(task.operation, false,
+                                          QStringLiteral("操作已取消"));
+            }
+            if (task.reportCompletion || task.refreshOnCancel)
+                refresh();
         }
 
         if (!_busy) {
@@ -174,6 +181,29 @@ void GitManager::runBoolean(const QString& operation,
         }
         return result;
     }, true, true, refreshAfter);
+}
+
+void GitManager::runHistoryOperation(
+    const QString& operation,
+    std::function<HistoryOperationResult(LibGit2Backend&, QString*)> work)
+{
+    enqueue(operation, [operation, work = std::move(work)](LibGit2Backend& backend) {
+        TaskResult result;
+        const HistoryOperationResult operationResult = work(backend, &result.error);
+        if (result.error.isEmpty()) {
+            result.apply = [operation, operationResult](GitManager& manager) {
+                emit manager.sigHistoryOperationFinished(
+                    operation, operationResult.status, operationResult.message);
+            };
+        } else {
+            const RepositoryState state = backend.snapshot(nullptr);
+            result.applyOnError = true;
+            result.apply = [state](GitManager& manager) {
+                manager.publishState(state);
+            };
+        }
+        return result;
+    }, true, false, true, true, true);
 }
 
 void GitManager::openRepository(const QString& path)
@@ -253,7 +283,7 @@ void GitManager::refresh()
             manager.publishState(state);
         };
         return result;
-    });
+    }, true, false, false, true, true);
 }
 
 void GitManager::cancelAll()
@@ -264,6 +294,7 @@ void GitManager::cancelAll()
     ++_generation;
     resetCommitHistoryState();
     ++_diffRequest;
+    ++_previewRequest;
 }
 
 void GitManager::setCommitHistoryQuery(const CommitHistoryQuery& query)
@@ -305,6 +336,81 @@ void GitManager::loadMoreCommits()
     if (!_isValid || _historyLoading || !_historyHasMore)
         return;
     requestCommitHistory(true);
+}
+
+void GitManager::requestResetPreview(const QString& targetRevision)
+{
+    discardQueuedPreviewTasks();
+    const quint64 requestId = ++_previewRequest;
+    enqueue(QStringLiteral("preview-reset"),
+            [targetRevision, requestId](LibGit2Backend& backend) {
+        TaskResult result;
+        const HistoryRewritePreview preview =
+            backend.resetPreview(targetRevision, &result.error);
+        result.apply = [preview, requestId](GitManager& manager) {
+            if (requestId == manager._previewRequest)
+                emit manager.sigResetPreviewReady(preview);
+        };
+        return result;
+    }, true, false, false);
+}
+
+void GitManager::requestRebasePlan(const QString& targetRevision)
+{
+    discardQueuedPreviewTasks();
+    const quint64 requestId = ++_previewRequest;
+    enqueue(QStringLiteral("preview-rebase"),
+            [targetRevision, requestId](LibGit2Backend& backend) {
+        TaskResult result;
+        const RebasePlan plan = backend.rebasePlan(targetRevision, &result.error);
+        result.apply = [plan, requestId](GitManager& manager) {
+            if (requestId == manager._previewRequest)
+                emit manager.sigRebasePlanReady(plan);
+        };
+        return result;
+    }, true, false, false);
+}
+
+void GitManager::mergeRevision(const QString& revision)
+{
+    runHistoryOperation(QStringLiteral("merge"),
+                        [revision](auto& backend, auto* error) {
+        return backend.mergeRevision(revision, error);
+    });
+}
+
+void GitManager::rebaseOnto(const RebasePlan& plan, bool interactive)
+{
+    runHistoryOperation(interactive ? QStringLiteral("interactive-rebase")
+                                    : QStringLiteral("rebase"),
+                        [plan, interactive](auto& backend, auto* error) {
+        return backend.rebaseOnto(plan, interactive, error);
+    });
+}
+
+void GitManager::cherryPickCommit(const QString& hash, int mainline)
+{
+    runHistoryOperation(QStringLiteral("cherry-pick"),
+                        [hash, mainline](auto& backend, auto* error) {
+        return backend.cherryPickCommit(hash, mainline, error);
+    });
+}
+
+void GitManager::revertCommit(const QString& hash, int mainline)
+{
+    runHistoryOperation(QStringLiteral("revert"),
+                        [hash, mainline](auto& backend, auto* error) {
+        return backend.revertCommit(hash, mainline, error);
+    });
+}
+
+void GitManager::resetToCommit(const HistoryRewritePreview& preview,
+                               ResetMode mode)
+{
+    runHistoryOperation(QStringLiteral("reset"),
+                        [preview, mode](auto& backend, auto* error) {
+        return backend.resetToCommit(preview, mode, error);
+    });
 }
 
 void GitManager::publishState(const RepositoryState& state)
@@ -414,6 +520,25 @@ void GitManager::discardQueuedDiffTasks()
     while (!_tasks.isEmpty()) {
         Task task = _tasks.dequeue();
         if (task.operation.startsWith(QLatin1String("diff-"))) {
+            task.cancelFlag->store(true);
+            continue;
+        }
+        remaining.enqueue(std::move(task));
+    }
+    _tasks = std::move(remaining);
+}
+
+void GitManager::discardQueuedPreviewTasks()
+{
+    if (_activeOperation.startsWith(QLatin1String("preview-"))
+        && _activeCancelFlag) {
+        _activeCancelFlag->store(true);
+    }
+
+    QQueue<Task> remaining;
+    while (!_tasks.isEmpty()) {
+        Task task = _tasks.dequeue();
+        if (task.operation.startsWith(QLatin1String("preview-"))) {
             task.cancelFlag->store(true);
             continue;
         }
@@ -632,9 +757,10 @@ void GitManager::stashDrop(const QString& ref)
 
 void GitManager::continueOperation(const QString& operation)
 {
-    runBoolean(operation + QStringLiteral("-continue"), [operation](auto& backend, auto* error) {
-        return backend.continueOperation(operation, error);
-    }, true, true);
+    runHistoryOperation(operation + QStringLiteral("-continue"),
+                        [operation](auto& backend, auto* error) {
+        return backend.continueHistoryOperation(operation, error);
+    });
 }
 
 void GitManager::abortOperation(const QString& operation)

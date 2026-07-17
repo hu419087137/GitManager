@@ -6,6 +6,8 @@
 #include "widgets/DiffWidget.h"
 #include "widgets/TerminalWidget.h"
 #include "dialogs/CommitDialog.h"
+#include "dialogs/RebaseDialog.h"
+#include "dialogs/ResetDialog.h"
 
 #include <QToolBar>
 #include <QAction>
@@ -21,6 +23,18 @@
 #include <QDir>
 #include <QLineEdit>
 #include <QRegularExpression>
+
+namespace {
+
+bool supportsContinueAbort(Git::RepositoryOperation operation)
+{
+    return operation == Git::RepositoryOperation::Merge
+        || operation == Git::RepositoryOperation::Rebase
+        || operation == Git::RepositoryOperation::CherryPick
+        || operation == Git::RepositoryOperation::Revert;
+}
+
+} // namespace
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
@@ -64,10 +78,14 @@ void MainWindow::setupToolBar()
     auto* commitAction  = tb->addAction(QStringLiteral("Commit"));
     auto* stashAction   = tb->addAction(QStringLiteral("Stash"));
     auto* remoteAction  = tb->addAction(QStringLiteral("Remote"));
-    auto* operationAction = tb->addAction(QStringLiteral("Continue/Abort"));
+    _operationAction      = tb->addAction(QStringLiteral("Continue/Abort"));
     _cancelAction       = tb->addAction(QStringLiteral("Cancel"));
     _cancelAction->setEnabled(false);
-    _repositoryActions = {refreshAction, pullAction, fetchAction, pushAction, commitAction, stashAction, remoteAction, operationAction};
+    _operationAction->setEnabled(false);
+    _repositoryActions = {refreshAction, pullAction, fetchAction, pushAction,
+                          commitAction, stashAction, remoteAction, _operationAction};
+    _inactiveDuringOperationActions = {pullAction, pushAction,
+                                       commitAction, stashAction};
 
     _repoLabel = new QLabel(QStringLiteral("  No repository"), this);
     statusBar()->addPermanentWidget(_repoLabel);
@@ -82,7 +100,8 @@ void MainWindow::setupToolBar()
     connect(commitAction,  &QAction::triggered, this, &MainWindow::slotCommit);
     connect(stashAction, &QAction::triggered, this, &MainWindow::slotStash);
     connect(remoteAction, &QAction::triggered, this, &MainWindow::slotRemote);
-    connect(operationAction, &QAction::triggered, this, &MainWindow::slotRepositoryOperation);
+    connect(_operationAction, &QAction::triggered,
+            this, &MainWindow::slotRepositoryOperation);
     connect(_cancelAction, &QAction::triggered, this, &MainWindow::slotCancelOperation);
 }
 
@@ -157,6 +176,12 @@ void MainWindow::connectSignals()
     });
     connect(_git, &Git::GitManager::sigCommitHistoryLoading,
             _commitGraph, &CommitGraphWidget::setHistoryLoading);
+    connect(_git, &Git::GitManager::sigResetPreviewReady,
+            this, &MainWindow::slotResetPreviewReady);
+    connect(_git, &Git::GitManager::sigRebasePlanReady,
+            this, &MainWindow::slotRebasePlanReady);
+    connect(_git, &Git::GitManager::sigHistoryOperationFinished,
+            this, &MainWindow::slotHistoryOperationFinished);
     connect(_git, &Git::GitManager::sigDiffReady, this,
             [this](const QString& diff, const QString&, bool staged,
                    bool hunkActionsEnabled) {
@@ -192,9 +217,13 @@ void MainWindow::connectSignals()
     });
     connect(_diffWidget, &DiffWidget::sigHunkActionRequested, this,
             [this](const QString& patch, int action) {
+        if (_git->isBusy() || !_git->isValid())
+            return;
         if (action == 2 && QMessageBox::warning(this, QStringLiteral("Discard Hunk"),
             QStringLiteral("Discard the selected hunk permanently?"), QMessageBox::Yes | QMessageBox::Cancel,
             QMessageBox::Cancel) != QMessageBox::Yes) return;
+        if (_git->isBusy() || !_git->isValid())
+            return;
         _git->applyPatch(patch, action == 0 || action == 1, action == 1 || action == 2);
     });
 
@@ -223,6 +252,18 @@ void MainWindow::connectSignals()
             _git, &Git::GitManager::setCommitHistoryQuery);
     connect(_commitGraph, &CommitGraphWidget::sigLoadMoreRequested,
             _git, &Git::GitManager::loadMoreCommits);
+    connect(_commitGraph, &CommitGraphWidget::sigCreateBranchRequested,
+            this, &MainWindow::slotCreateBranch);
+    connect(_commitGraph, &CommitGraphWidget::sigMergeRequested,
+            this, &MainWindow::slotMergeRevision);
+    connect(_commitGraph, &CommitGraphWidget::sigRebaseRequested,
+            this, &MainWindow::slotRebaseRevision);
+    connect(_commitGraph, &CommitGraphWidget::sigCherryPickRequested,
+            this, &MainWindow::slotCherryPickCommit);
+    connect(_commitGraph, &CommitGraphWidget::sigRevertRequested,
+            this, &MainWindow::slotRevertCommit);
+    connect(_commitGraph, &CommitGraphWidget::sigResetRequested,
+            this, &MainWindow::slotResetCommit);
 
     connect(_statusWidget, &StatusWidget::sigFileSelected,
             this, &MainWindow::slotFileSelected);
@@ -247,6 +288,10 @@ void MainWindow::connectSignals()
             this, &MainWindow::slotDeleteBranch);
     connect(_branchList, &BranchListWidget::sigCreateFromRequested,
             this, &MainWindow::slotCreateBranch);
+    connect(_branchList, &BranchListWidget::sigMergeRequested,
+            this, &MainWindow::slotMergeRevision);
+    connect(_branchList, &BranchListWidget::sigRebaseRequested,
+            this, &MainWindow::slotRebaseRevision);
 
     connect(_commitGraph, &CommitGraphWidget::sigCreateTagRequested,
             this, &MainWindow::slotCreateTag);
@@ -403,23 +448,54 @@ void MainWindow::slotStash()
 
 void MainWindow::slotRepositoryOperation()
 {
-    const QStringList actions={QStringLiteral("Continue merge"),QStringLiteral("Abort merge"),
-        QStringLiteral("Continue rebase"),QStringLiteral("Abort rebase"),
-        QStringLiteral("Continue cherry-pick"),QStringLiteral("Abort cherry-pick")};
-    bool ok=false; const QString action=QInputDialog::getItem(this,QStringLiteral("Repository Operation"),QStringLiteral("Action:"),actions,0,false,&ok);
-    if(!ok)return;
-    const QString op=action.contains("merge")?QStringLiteral("merge"):action.contains("rebase")?QStringLiteral("rebase"):QStringLiteral("cherry-pick");
-    if(action.startsWith("Continue")) {
-        _git->continueOperation(op);
-    } else {
-        if (QMessageBox::warning(
-                this, QStringLiteral("Abort Repository Operation"),
-                QStringLiteral("Abort the active %1 operation and restore its starting state? "
-                               "Tracked changes created by the operation will be discarded; "
-                               "untracked files are preserved.").arg(op),
-                QMessageBox::Yes | QMessageBox::Cancel,
-                QMessageBox::Cancel) == QMessageBox::Yes)
-            _git->abortOperation(op);
+    QString operation;
+    switch (_state.activeOperation) {
+    case Git::RepositoryOperation::Merge:
+        operation = QStringLiteral("merge");
+        break;
+    case Git::RepositoryOperation::Rebase:
+        operation = QStringLiteral("rebase");
+        break;
+    case Git::RepositoryOperation::CherryPick:
+        operation = QStringLiteral("cherry-pick");
+        break;
+    case Git::RepositoryOperation::Revert:
+        operation = QStringLiteral("revert");
+        break;
+    case Git::RepositoryOperation::None:
+        QMessageBox::information(this, QStringLiteral("Repository Operation"),
+                                 QStringLiteral("No repository operation is in progress."));
+        return;
+    case Git::RepositoryOperation::Unknown:
+        QMessageBox::warning(this, QStringLiteral("Repository Operation"),
+                             QStringLiteral("The active repository operation is not supported."));
+        return;
+    }
+
+    const QStringList actions = {
+        QStringLiteral("Continue %1").arg(operation),
+        QStringLiteral("Abort %1").arg(operation)
+    };
+    bool accepted = false;
+    const QString action = QInputDialog::getItem(
+        this, QStringLiteral("Repository Operation"), QStringLiteral("Action:"),
+        actions, 0, false, &accepted);
+    if (!accepted)
+        return;
+    if (action == actions.first()) {
+        _git->continueOperation(operation);
+        return;
+    }
+
+    if (QMessageBox::warning(
+            this, QStringLiteral("Abort Repository Operation"),
+            QStringLiteral("Abort the active %1 operation and restore its starting state? "
+                           "Changes created while resolving the operation will be discarded; "
+                           "untracked files are preserved unless they obstruct checkout.")
+                .arg(operation),
+            QMessageBox::Yes | QMessageBox::Cancel,
+            QMessageBox::Cancel) == QMessageBox::Yes) {
+        _git->abortOperation(operation);
     }
 }
 
@@ -447,32 +523,44 @@ void MainWindow::slotCommitSelected(const Git::Commit& commit)
 
 void MainWindow::slotFileSelected(const QString& filePath, bool staged, bool untracked)
 {
+    if (_git->isBusy() || !_git->isValid())
+        return;
     _requestedDiffSource = DiffSource::File;
     _git->fetchFileDiff(filePath, staged, untracked);
 }
 
 void MainWindow::slotStageFile(const QString& filePath)
 {
+    if (_git->isBusy() || !_git->isValid())
+        return;
     _git->stageFile(filePath);
 }
 
 void MainWindow::slotUnstageFile(const QString& filePath)
 {
+    if (_git->isBusy() || !_git->isValid())
+        return;
     _git->unstageFile(filePath);
 }
 
 void MainWindow::slotStageAll()
 {
+    if (_git->isBusy() || !_git->isValid())
+        return;
     _git->stageAll();
 }
 
 void MainWindow::slotUnstageAll()
 {
+    if (_git->isBusy() || !_git->isValid())
+        return;
     _git->unstageAll();
 }
 
 void MainWindow::slotIgnoreFile(const QString& filePath)
 {
+    if (_git->isBusy() || !_git->isValid())
+        return;
     if (_git->addToGitIgnore(filePath)) {
         refresh();
         showStatus(QStringLiteral("Added to .gitignore: %1").arg(filePath));
@@ -500,6 +588,71 @@ void MainWindow::slotCreateBranch(const QString& fromBranch)
         return;
 
     _git->createBranch(name.trimmed(), fromBranch);
+}
+
+void MainWindow::slotMergeRevision(const QString& revision)
+{
+    if (!_git->isValid() || revision.isEmpty())
+        return;
+    const QString target = revision.left(12);
+    if (QMessageBox::question(
+            this, QStringLiteral("Merge into Current Branch"),
+            QStringLiteral("Merge '%1' into the current branch?\n\n"
+                           "If conflicts occur, the repository will remain in merge "
+                           "state so they can be resolved or the merge can be aborted.")
+                .arg(target),
+            QMessageBox::Yes | QMessageBox::Cancel,
+            QMessageBox::Cancel) != QMessageBox::Yes) {
+        return;
+    }
+    _git->mergeRevision(revision);
+}
+
+void MainWindow::slotRebaseRevision(const QString& revision)
+{
+    if (!_git->isValid() || revision.isEmpty())
+        return;
+    showStatus(QStringLiteral("Preparing rebase preview..."));
+    _git->requestRebasePlan(revision);
+}
+
+void MainWindow::slotCherryPickCommit(const QString& hash, int mainline)
+{
+    if (!_git->isValid() || hash.isEmpty())
+        return;
+    QString text = QStringLiteral("Apply commit %1 on top of the current branch?")
+                       .arg(hash.left(12));
+    if (mainline > 0)
+        text += QStringLiteral("\n\nParent %1 will be used as the mainline.").arg(mainline);
+    if (QMessageBox::question(this, QStringLiteral("Cherry-pick Commit"), text,
+                              QMessageBox::Yes | QMessageBox::Cancel,
+                              QMessageBox::Cancel) == QMessageBox::Yes) {
+        _git->cherryPickCommit(hash, mainline);
+    }
+}
+
+void MainWindow::slotRevertCommit(const QString& hash, int mainline)
+{
+    if (!_git->isValid() || hash.isEmpty())
+        return;
+    QString text = QStringLiteral(
+        "Create a new commit that reverses %1? Existing history will not be rewritten.")
+                       .arg(hash.left(12));
+    if (mainline > 0)
+        text += QStringLiteral("\n\nParent %1 will be used as the mainline.").arg(mainline);
+    if (QMessageBox::question(this, QStringLiteral("Revert Commit"), text,
+                              QMessageBox::Yes | QMessageBox::Cancel,
+                              QMessageBox::Cancel) == QMessageBox::Yes) {
+        _git->revertCommit(hash, mainline);
+    }
+}
+
+void MainWindow::slotResetCommit(const QString& hash)
+{
+    if (!_git->isValid() || hash.isEmpty())
+        return;
+    showStatus(QStringLiteral("Preparing reset preview..."));
+    _git->requestResetPreview(hash);
 }
 
 void MainWindow::slotCreateTag(const QString& commitHash)
@@ -556,9 +709,12 @@ void MainWindow::beginRepositoryTransition(const QString& path)
     _commitGraph->setHistoryLoading(true);
     _branchList->setBranches({});
     _branchList->setEnabled(false);
+    if (_operationAction)
+        _operationAction->setEnabled(false);
     _statusWidget->setFiles({});
     _statusWidget->setEnabled(false);
     _diffWidget->clearDiff();
+    _diffWidget->setEnabled(false);
     _requestedDiffSource = DiffSource::None;
     _displayedDiffSource = DiffSource::None;
     _rightTabs->setCurrentWidget(_statusWidget);
@@ -575,17 +731,24 @@ void MainWindow::refresh()
 
 void MainWindow::slotDiscardFile(const QString& filePath, bool untracked)
 {
+    if (_git->isBusy() || !_git->isValid())
+        return;
     const QString text = untracked ? QStringLiteral("Delete untracked file '%1' permanently?").arg(filePath)
                                    : QStringLiteral("Discard all unstaged changes in '%1'?").arg(filePath);
     if (QMessageBox::warning(this, QStringLiteral("Confirm Destructive Operation"), text,
                              QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes) return;
+    if (_git->isBusy() || !_git->isValid())
+        return;
     if (untracked) _git->removeUntracked(filePath); else _git->discardFile(filePath);
 }
 
 void MainWindow::slotResolveFile(const QString& filePath, bool ours)
 {
+    if (_git->isBusy() || !_git->isValid())
+        return;
     if (QMessageBox::question(this, QStringLiteral("Resolve Conflict"),
-        QStringLiteral("Replace '%1' with the %2 version?").arg(filePath, ours ? QStringLiteral("current") : QStringLiteral("incoming"))) == QMessageBox::Yes)
+        QStringLiteral("Replace '%1' with the %2 version?").arg(filePath, ours ? QStringLiteral("current") : QStringLiteral("incoming"))) == QMessageBox::Yes
+        && !_git->isBusy() && _git->isValid())
         _git->resolveConflict(filePath, ours);
 }
 
@@ -611,7 +774,8 @@ void MainWindow::slotStateReady(const Git::RepositoryState& state)
 {
     _state = state;
     _branchList->setEnabled(true);
-    _statusWidget->setEnabled(true);
+    _statusWidget->setEnabled(!_git->isBusy());
+    _diffWidget->setEnabled(!_git->isBusy());
     _commitGraph->setBranches(state.branches);
     _branchList->setBranches(state.branches);
     _statusWidget->setFiles(state.files);
@@ -619,8 +783,19 @@ void MainWindow::slotStateReady(const Git::RepositoryState& state)
     _git->cancelDiffRequest();
     _requestedDiffSource = DiffSource::None;
     _displayedDiffSource = DiffSource::None;
-    showStatus(QStringLiteral("Ready — %1 [%2] %3")
-        .arg(state.rootPath, state.displayHead(), state.syncText()));
+    const QString operation = state.activeOperationText();
+    const QString operationSuffix = operation.isEmpty()
+        ? QString() : QStringLiteral(" — %1 in progress").arg(operation);
+    showStatus(QStringLiteral("Ready — %1 [%2] %3%4")
+        .arg(state.rootPath, state.displayHead(), state.syncText(), operationSuffix));
+    if (_operationAction)
+        _operationAction->setEnabled(!_git->isBusy()
+                                     && supportsContinueAbort(
+                                         state.activeOperation));
+    const bool historyOperationsEnabled = !_git->isBusy()
+        && state.activeOperation == Git::RepositoryOperation::None;
+    _commitGraph->setOperationsEnabled(historyOperationsEnabled);
+    _branchList->setOperationsEnabled(historyOperationsEnabled);
 }
 
 void MainWindow::slotOperationFinished(const QString& operation, bool success, const QString& message)
@@ -629,11 +804,65 @@ void MainWindow::slotOperationFinished(const QString& operation, bool success, c
                        : QStringLiteral("%1 failed.").arg(operation));
 }
 
+void MainWindow::slotResetPreviewReady(const Git::HistoryRewritePreview& preview)
+{
+    ResetDialog dialog(preview, this);
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+    _git->resetToCommit(preview, dialog.resetMode());
+}
+
+void MainWindow::slotRebasePlanReady(const Git::RebasePlan& plan)
+{
+    RebaseDialog dialog(plan, this);
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+    _git->rebaseOnto(dialog.rebasePlan(), dialog.interactiveMode());
+}
+
+void MainWindow::slotHistoryOperationFinished(
+    const QString& operation, Git::HistoryOperationStatus status,
+    const QString& message)
+{
+    const QString detail = message.isEmpty()
+        ? QStringLiteral("History operation finished.") : message;
+    switch (status) {
+    case Git::HistoryOperationStatus::Completed:
+    case Git::HistoryOperationStatus::UpToDate:
+        showStatus(QStringLiteral("%1: %2").arg(operation, detail));
+        break;
+    case Git::HistoryOperationStatus::Conflicts:
+        _rightTabs->setCurrentWidget(_statusWidget);
+        showStatus(detail);
+        QMessageBox::warning(this, QStringLiteral("Conflicts Require Attention"), detail);
+        break;
+    case Git::HistoryOperationStatus::PausedForEdit:
+        _rightTabs->setCurrentWidget(_statusWidget);
+        showStatus(detail);
+        QMessageBox::information(this, QStringLiteral("Interactive Rebase Paused"), detail);
+        break;
+    }
+}
+
 void MainWindow::slotBusyChanged(bool busy)
 {
     _cancelAction->setEnabled(busy);
     for (QAction* action : _repositoryActions)
         action->setEnabled(!busy && _git->isValid());
+    const bool repositoryReady = !busy && _git->isValid();
+    const bool operationsEnabled = repositoryReady
+        && _state.activeOperation == Git::RepositoryOperation::None;
+    for (QAction* action : _inactiveDuringOperationActions)
+        action->setEnabled(operationsEnabled);
+    _statusWidget->setEnabled(repositoryReady);
+    _diffWidget->setEnabled(repositoryReady);
+    _commitGraph->setOperationsEnabled(operationsEnabled);
+    _branchList->setOperationsEnabled(operationsEnabled);
+    if (_operationAction) {
+        _operationAction->setEnabled(
+            repositoryReady
+            && supportsContinueAbort(_state.activeOperation));
+    }
 }
 
 void MainWindow::showStatus(const QString& msg)

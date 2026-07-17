@@ -140,8 +140,14 @@ set(SOURCES
     widgets/DiffWidget.cpp
     widgets/TerminalWidget.h
     widgets/TerminalWidget.cpp
+    widgets/InteractiveRebaseWidget.h
+    widgets/InteractiveRebaseWidget.cpp
     dialogs/CommitDialog.h
     dialogs/CommitDialog.cpp
+    dialogs/RebaseDialog.h
+    dialogs/RebaseDialog.cpp
+    dialogs/ResetDialog.h
+    dialogs/ResetDialog.cpp
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES})

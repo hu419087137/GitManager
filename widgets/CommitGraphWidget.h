@@ -56,6 +56,9 @@ public:
     /** @brief 按完整或唯一短 hash 选择已加载提交。 */
     void selectCommit(const QString& hash);
 
+    /** @brief 在 Git 任务运行期间禁用会修改历史的菜单项。 */
+    void setOperationsEnabled(bool enabled) { _operationsEnabled = enabled; }
+
 signals:
     /** @brief 用户点击某行时发射 */
     void sigCommitSelected(const Git::Commit& commit);
@@ -77,6 +80,13 @@ signals:
 
     /** @brief 当前提交选择已清空。 */
     void sigCommitSelectionCleared();
+
+    void sigCreateBranchRequested(const QString& commitHash);
+    void sigMergeRequested(const QString& revision);
+    void sigRebaseRequested(const QString& revision);
+    void sigCherryPickRequested(const QString& commitHash, int mainline);
+    void sigRevertRequested(const QString& commitHash, int mainline);
+    void sigResetRequested(const QString& commitHash);
 
 private slots:
     void slotSelectionChanged();
@@ -110,6 +120,7 @@ private:
     bool                 _hasMore         {false};
     bool                 _historyLoading  {false};
     bool                 _queryPending    {false};
+    bool                 _operationsEnabled {false};
 };
 
 // ============================================================

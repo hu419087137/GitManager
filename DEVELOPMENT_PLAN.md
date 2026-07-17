@@ -359,18 +359,30 @@ tests/
 
 ### 3.2 历史修改操作
 
+状态：已完成。
+
 修改文件：
 
-- [ ] `core/GitManager.h/.cpp`
-  - 增加 Merge、Rebase、Cherry-pick、Revert 和 Reset。
-- [ ] `widgets/CommitGraphWidget.cpp`
-  - 为提交和分支增加上下文菜单。
+- [x] `core/GitTypes.h`、`core/RepositoryState.h/.cpp`
+  - 增加历史操作、Reset/Rebase 计划和活动仓库操作类型。
+- [x] `core/LibGit2Backend.h/.cpp`
+  - 使用 libgit2 实现 Merge、Rebase、Cherry-pick、Revert、Reset、Continue 和 Abort。
+- [x] `core/GitManager.h/.cpp`
+  - 增加异步预览、请求隔离、历史操作结果和取消后的状态恢复。
+- [x] `MainWindow.h/.cpp`
+  - 接入历史操作、Continue/Abort 和 busy/active-operation 写入门禁。
+- [x] `widgets/CommitGraphWidget.h/.cpp`
+  - 为提交增加历史操作上下文菜单。
+- [x] `widgets/BranchListWidget.h/.cpp`
+  - 为分支增加 Merge/Rebase 菜单并在危险状态下禁止切换。
+- [x] `CMakeLists.txt`、`tests/CMakeLists.txt`、`tests/integration/TestRepository.cpp`、`tests/unit/TestGitManager.cpp`、`tests/unit/TestCommitGraphWidget.cpp`
+  - 接入新组件并增加后端、异步和菜单回归测试。
 
 建议新增：
 
-- [ ] `dialogs/ResetDialog.h/.cpp`
-- [ ] `dialogs/RebaseDialog.h/.cpp`
-- [ ] `widgets/InteractiveRebaseWidget.h/.cpp`
+- [x] `dialogs/ResetDialog.h/.cpp`
+- [x] `dialogs/RebaseDialog.h/.cpp`
+- [x] `widgets/InteractiveRebaseWidget.h/.cpp`
 
 验收标准：
 
@@ -378,12 +390,23 @@ tests/
 - Interactive Rebase 支持 pick、reword、edit、squash、fixup 和 drop。
 - 改写已推送历史前提供醒目警告。
 
+实现说明：
+
+- Merge 支持已最新、快进、普通合并和冲突恢复，并遵循仓库的 fast-forward 配置。
+- Rebase、Cherry-pick、Revert 和 Reset 均直接使用 libgit2，不调用 `git.exe`；Merge commit 可选择 mainline 父提交。
+- Interactive Rebase 使用固定拓扑顺序，暂不保留 merge topology；通过 `.git/rebase-merge/gitmanager.json` 保存带会话绑定和写前日志的计划，可在冲突或 edit 暂停、程序重开后安全继续或终止。
+- squash/fixup 的 rewritten 映射使用固定 LF、原子写入和独立备份；恢复时校验 HEAD、tree、message、parent、author 及映射完整性，无法证明安全时拒绝继续。
+- 历史改写前同时校验预览时的 HEAD 和当前分支身份，统计远程引用已可达的提交并要求独立确认；危险操作执行期间禁用提交图和分支菜单入口。
+- 外部工具启动的多提交 Cherry-pick/Revert sequencer 当前不接管，界面会识别为未知操作并安全拒绝 Continue/Abort。
+- 快进 Merge 在 checkout 前先锁定当前分支引用，并在 checkout 后通过事务原子提交引用更新；若引用锁或提交失败，会恢复原始工作树和索引状态。
+- 自动化测试覆盖 Merge、普通 Rebase、Cherry-pick、Revert、三种 Reset、两个 merge mainline、六种 Interactive Rebase 动作、冲突 Continue/Abort、关闭重开、写前恢复、Git notes 迁移、外部 sequencer 安全拒绝、分支身份漂移防护、快进引用锁冲突恢复和 Abort。
+
 ### 3.3 分支、标签和比较
 
 修改文件：
 
 - [ ] `widgets/BranchListWidget.h/.cpp`
-  - 增加重命名、Merge、Rebase、发布和取消跟踪。
+  - 增加重命名、发布和取消跟踪；Merge/Rebase 已在 3.2 完成。
 - [ ] `widgets/CommitGraphWidget.h/.cpp`
   - 支持比较两个提交或分支。
 - [ ] `core/GitManager.h/.cpp`

@@ -10,6 +10,69 @@
 
 namespace Git {
 
+enum class ResetMode {
+    Soft,
+    Mixed,
+    Hard
+};
+
+enum class RebaseAction {
+    Pick,
+    Reword,
+    Edit,
+    Squash,
+    Fixup,
+    Drop
+};
+
+enum class RepositoryOperation {
+    None,
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+    Unknown
+};
+
+enum class HistoryOperationStatus {
+    Completed,
+    UpToDate,
+    Conflicts,
+    PausedForEdit
+};
+
+struct HistoryOperationResult {
+    HistoryOperationStatus status {HistoryOperationStatus::Completed};
+    QString message;
+};
+
+struct HistoryRewritePreview {
+    QString revision;
+    QString targetHash;
+    QString expectedHead;
+    QString currentBranch;
+    QString upstream;
+    int affectedCount {0};
+    int publishedCount {0};
+    bool dirty {false};
+    RepositoryOperation activeOperation {RepositoryOperation::None};
+};
+
+struct RebasePlanItem {
+    QString hash;
+    QString subject;
+    QString message;
+    RebaseAction action {RebaseAction::Pick};
+    QString rewrittenMessage;
+    bool published {false};
+    int parentCount {0};
+};
+
+struct RebasePlan {
+    HistoryRewritePreview preview;
+    QVector<RebasePlanItem> items;
+};
+
 /** @brief 单次提交信息 */
 struct Commit {
     QString hash;
@@ -152,5 +215,13 @@ inline QColor laneColor(int lane) {
 Q_DECLARE_METATYPE(Git::Commit)
 Q_DECLARE_METATYPE(Git::CommitHistoryQuery)
 Q_DECLARE_METATYPE(Git::CommitHistoryPage)
+Q_DECLARE_METATYPE(Git::ResetMode)
+Q_DECLARE_METATYPE(Git::RebaseAction)
+Q_DECLARE_METATYPE(Git::RepositoryOperation)
+Q_DECLARE_METATYPE(Git::HistoryOperationStatus)
+Q_DECLARE_METATYPE(Git::HistoryOperationResult)
+Q_DECLARE_METATYPE(Git::HistoryRewritePreview)
+Q_DECLARE_METATYPE(Git::RebasePlanItem)
+Q_DECLARE_METATYPE(Git::RebasePlan)
 
 #endif // GITTYPES_H
