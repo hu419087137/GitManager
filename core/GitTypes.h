@@ -73,6 +73,124 @@ struct RebasePlan {
     QVector<RebasePlanItem> items;
 };
 
+struct WorktreeInfo {
+    QString name;
+    QString path;
+    QString headBranch;
+    QString headHash;
+    bool detached {false};
+    bool locked {false};
+    QString lockReason;
+    bool valid {true};
+    bool current {false};
+};
+
+struct SubmoduleInfo {
+    QString name;
+    QString path;
+    QString url;
+    QString branch;
+    QString indexHash;
+    QString workdirHash;
+    bool initialized {false};
+    bool dirty {false};
+};
+
+struct LfsLockInfo {
+    QString id;
+    QString path;
+    QString owner;
+    QString lockedAt;
+    bool ownedByCurrentUser {false};
+};
+
+struct LfsState {
+    bool installed {false};
+    QString version;
+    QStringList trackedPatterns;
+    QVector<LfsLockInfo> locks;
+    QString locksError;
+};
+
+enum class HostingProvider {
+    Unknown,
+    GitHub,
+    GitLab,
+    AzureDevOps
+};
+
+struct RemoteInfo {
+    QString name;
+    QString fetchUrl;
+    QString pushUrl;
+};
+
+struct HostingRemoteInfo {
+    QString remoteName;
+    QString sourceUrl;
+    QString webUrl;
+    QString commitUrl;
+    QString changesUrl;
+    QString createChangeUrl;
+    QString issuesUrl;
+    HostingProvider provider {HostingProvider::Unknown};
+};
+
+struct HostingChangeInfo {
+    QString id;
+    QString title;
+    QString author;
+    QString state;
+    QString webUrl;
+    QString headSha;
+    bool draft {false};
+};
+
+struct HostingIssueInfo {
+    QString id;
+    QString title;
+    QString author;
+    QString state;
+    QString webUrl;
+};
+
+struct HostingReviewFile {
+    QString path;
+    QString previousPath;
+    QString status;
+    QString patch;
+    QString webUrl;
+    QString baseSha;
+    QString startSha;
+    QString headSha;
+};
+
+struct DiagnosticItem {
+    QString category;
+    QString name;
+    QString value;
+    bool warning {false};
+};
+
+struct GitDiagnosticReport {
+    QVector<DiagnosticItem> items;
+    QVector<RemoteInfo> remotes;
+};
+
+struct HookInfo {
+    QString name;
+    QString path;
+    bool executable {false};
+};
+
+struct HookResult {
+    QString name;
+    QString output;
+    int exitCode {0};
+    bool success {true};
+    bool timedOut {false};
+};
+
 /** @brief 单次提交信息 */
 struct Commit {
     QString hash;
@@ -223,5 +341,18 @@ Q_DECLARE_METATYPE(Git::HistoryOperationResult)
 Q_DECLARE_METATYPE(Git::HistoryRewritePreview)
 Q_DECLARE_METATYPE(Git::RebasePlanItem)
 Q_DECLARE_METATYPE(Git::RebasePlan)
+Q_DECLARE_METATYPE(Git::WorktreeInfo)
+Q_DECLARE_METATYPE(Git::LfsLockInfo)
+Q_DECLARE_METATYPE(Git::LfsState)
+Q_DECLARE_METATYPE(Git::HostingProvider)
+Q_DECLARE_METATYPE(Git::RemoteInfo)
+Q_DECLARE_METATYPE(Git::HostingRemoteInfo)
+Q_DECLARE_METATYPE(Git::HostingChangeInfo)
+Q_DECLARE_METATYPE(Git::HostingIssueInfo)
+Q_DECLARE_METATYPE(Git::HostingReviewFile)
+Q_DECLARE_METATYPE(Git::DiagnosticItem)
+Q_DECLARE_METATYPE(Git::GitDiagnosticReport)
+Q_DECLARE_METATYPE(Git::HookInfo)
+Q_DECLARE_METATYPE(Git::HookResult)
 
 #endif // GITTYPES_H

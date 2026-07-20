@@ -9,6 +9,7 @@
 #include <QDateTime>
 #include <QDebug>
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QHash>
@@ -66,6 +67,8 @@ private:
 
 using AnnotatedHandle = GitHandle<git_annotated_commit, git_annotated_commit_free>;
 using CommitHandle = GitHandle<git_commit, git_commit_free>;
+using ConfigHandle = GitHandle<git_config, git_config_free>;
+using ConfigIteratorHandle = GitHandle<git_config_iterator, git_config_iterator_free>;
 using DiffHandle = GitHandle<git_diff, git_diff_free>;
 using IndexHandle = GitHandle<git_index, git_index_free>;
 using ObjectHandle = GitHandle<git_object, git_object_free>;
@@ -78,6 +81,9 @@ using StatusListHandle = GitHandle<git_status_list, git_status_list_free>;
 using TreeHandle = GitHandle<git_tree, git_tree_free>;
 using TreeEntryHandle = GitHandle<git_tree_entry, git_tree_entry_free>;
 using TransactionHandle = GitHandle<git_transaction, git_transaction_free>;
+using WorktreeHandle = GitHandle<git_worktree, git_worktree_free>;
+using SubmoduleHandle = GitHandle<git_submodule, git_submodule_free>;
+using RepositoryHandle = GitHandle<git_repository, git_repository_free>;
 
 QString oidText(const git_oid* oid)
 {
@@ -122,6 +128,8 @@ bool ensureNoActiveOperation(git_repository* repository, QString* error)
 
 File::Status statusValue(unsigned int flags, bool index)
 {
+    if (!index && (flags & GIT_STATUS_WT_NEW))
+        return File::Status::E_Untracked;
     if (flags & (index ? GIT_STATUS_INDEX_NEW : GIT_STATUS_WT_NEW))
         return File::Status::E_Added;
     if (flags & (index ? GIT_STATUS_INDEX_MODIFIED : GIT_STATUS_WT_MODIFIED))
@@ -163,6 +171,169 @@ bool lookupCommit(git_repository* repository, const QString& revision,
         || git_commit_lookup(commit.out(), repository,
                              git_object_id(peeled.get())) < 0) {
         fail(error, fallback);
+        return false;
+    }
+    return true;
+}
+
+QString resolveWorktreePath(const QString& path)
+{
+    return QDir::cleanPath(QDir::fromNativeSeparators(path));
+}
+
+bool writeTextFile(const QString& path, const QString& content, QString* error)
+{
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (error)
+            *error = file.errorString();
+        return false;
+    }
+    if (file.write(content.toUtf8()) < 0) {
+        if (error)
+            *error = file.errorString();
+        return false;
+    }
+    if (!file.commit()) {
+        if (error)
+            *error = file.errorString();
+        return false;
+    }
+    return true;
+}
+
+bool deleteConfigSection(git_config* config, const QString& section,
+                         QString* error)
+{
+    const QString expression = QStringLiteral("^submodule\\.%1\\..*$")
+        .arg(QRegularExpression::escape(section));
+    ConfigIteratorHandle iterator;
+    if (git_config_iterator_glob_new(iterator.out(), config,
+                                     expression.toUtf8().constData()) < 0)
+        return fail(error, QStringLiteral("Cannot inspect submodule configuration."));
+
+    QStringList keys;
+    git_config_entry* entry = nullptr;
+    int rc = 0;
+    while ((rc = git_config_next(&entry, iterator.get())) == 0) {
+        if (entry && entry->name)
+            keys.append(QString::fromUtf8(entry->name));
+    }
+    if (rc != GIT_ITEROVER)
+        return fail(error, QStringLiteral("Cannot inspect submodule configuration."));
+    git_error_clear();
+    iterator.reset();
+    for (const QString& key : keys) {
+        if (git_config_delete_entry(config, key.toUtf8().constData()) < 0)
+            return fail(error, QStringLiteral("Cannot remove submodule configuration."));
+    }
+    return true;
+}
+
+bool copyDirectoryRecursively(const QString& sourcePath, const QString& targetPath,
+                              QString* error)
+{
+    QDir source(sourcePath);
+    if (!source.exists()) {
+        if (error)
+            *error = QStringLiteral("Source worktree directory does not exist.");
+        return false;
+    }
+    if (!QDir().mkpath(targetPath)) {
+        if (error)
+            *error = QStringLiteral("Cannot create target worktree directory.");
+        return false;
+    }
+
+    QDirIterator it(sourcePath,
+                    QDir::NoDotAndDotDot | QDir::AllEntries | QDir::Hidden
+                        | QDir::System,
+                    QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        it.next();
+        const QFileInfo info = it.fileInfo();
+        const QString relative = source.relativeFilePath(info.filePath());
+        const QString target = QDir(targetPath).filePath(relative);
+
+        if (info.isDir()) {
+            if (!QDir().mkpath(target)) {
+                if (error)
+                    *error = QStringLiteral("Cannot create target subdirectory.");
+                return false;
+            }
+            continue;
+        }
+
+        const QFileInfo targetInfo(target);
+        if (!QDir().mkpath(targetInfo.dir().absolutePath())) {
+            if (error)
+                *error = QStringLiteral("Cannot create target parent directory.");
+            return false;
+        }
+        if (QFile::exists(target) && !QFile::remove(target)) {
+            if (error)
+                *error = QStringLiteral("Cannot replace target file.");
+            return false;
+        }
+
+        bool copied = false;
+        if (info.isSymLink()) {
+            copied = QFile::link(info.symLinkTarget(), target);
+        } else {
+            copied = QFile::copy(info.filePath(), target);
+            if (copied)
+                QFile::setPermissions(target, info.permissions());
+        }
+        if (!copied) {
+            if (error)
+                *error = QStringLiteral("Cannot copy worktree contents.");
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool moveDirectoryRecursively(const QString& sourcePath, const QString& targetPath,
+                              QString* error)
+{
+    const QString source = QDir::cleanPath(sourcePath);
+    const QString target = QDir::cleanPath(targetPath);
+    if (source.compare(target, Qt::CaseInsensitive) == 0)
+        return true;
+
+    const QString sourcePrefix = source.endsWith(QDir::separator())
+        ? source : source + QDir::separator();
+    if (target.startsWith(sourcePrefix, Qt::CaseInsensitive)) {
+        if (error)
+            *error = QStringLiteral("Cannot move a worktree into itself.");
+        return false;
+    }
+
+    const QFileInfo targetInfo(target);
+    if (targetInfo.exists()) {
+        if (error)
+            *error = QStringLiteral("Target worktree path already exists.");
+        return false;
+    }
+    if (!QDir().mkpath(targetInfo.dir().absolutePath())) {
+        if (error)
+            *error = QStringLiteral("Cannot create target parent directory.");
+        return false;
+    }
+
+    const QFileInfo sourceInfo(source);
+    QDir sourceParent(sourceInfo.dir());
+    if (sourceParent.rename(sourceInfo.fileName(), target))
+        return true;
+
+    if (!copyDirectoryRecursively(source, target, error))
+        return false;
+
+    QDir sourceDir(source);
+    if (!sourceDir.removeRecursively()) {
+        if (error)
+            *error = QStringLiteral("Cannot remove original worktree directory.");
         return false;
     }
     return true;
@@ -720,6 +891,9 @@ struct NetworkContext {
     LibGit2Backend::ProgressCallback progress;
     const std::atomic_bool* cancelFlag {nullptr};
     QString pushError;
+    QByteArray leaseDestination;
+    git_oid leaseExpected {};
+    bool forceWithLease {false};
 
     bool cancelled() const
     {
@@ -817,6 +991,31 @@ int pushUpdateCallback(const char*, const char* status, void* payload)
     return GIT_EUSER;
 }
 
+int pushNegotiationCallback(const git_push_update** updates, size_t length,
+                            void* payload)
+{
+    auto* context = static_cast<NetworkContext*>(payload);
+    if (!context || !context->forceWithLease)
+        return 0;
+    for (size_t index = 0; index < length; ++index) {
+        const git_push_update* update = updates[index];
+        if (!update || !update->dst_refname
+            || context->leaseDestination != update->dst_refname) {
+            continue;
+        }
+        if (git_oid_cmp(&update->src, &context->leaseExpected) == 0)
+            return 0;
+        context->pushError = QStringLiteral(
+            "Force-with-lease rejected: the remote branch changed since the last fetch.");
+        git_error_set_str(GIT_ERROR_NET, context->pushError.toUtf8().constData());
+        return GIT_EUSER;
+    }
+    context->pushError = QStringLiteral(
+        "Force-with-lease rejected: the remote branch was not advertised.");
+    git_error_set_str(GIT_ERROR_NET, context->pushError.toUtf8().constData());
+    return GIT_EUSER;
+}
+
 NetworkContext networkContext(const RemoteCredentials& credentials,
                               const LibGit2Backend::ProgressCallback& callback,
                               const std::atomic_bool* cancelFlag)
@@ -837,6 +1036,7 @@ void configureCallbacks(git_remote_callbacks& callbacks,
     callbacks.transfer_progress = transferCallback;
     callbacks.push_transfer_progress = pushTransferCallback;
     callbacks.push_update_reference = pushUpdateCallback;
+    callbacks.push_negotiation = pushNegotiationCallback;
     callbacks.payload = context;
 }
 
@@ -1271,6 +1471,7 @@ RepositoryState LibGit2Backend::snapshot(QString* error) const
     if (!refs.valid)
         return result;
     result.refsVersion = refs.version;
+    result.worktrees = worktrees(nullptr);
     git_branch_iterator* rawIterator = nullptr;
     if (git_branch_iterator_new(&rawIterator, _repository, GIT_BRANCH_ALL) == 0) {
         git_reference* rawBranch = nullptr;
@@ -1379,6 +1580,7 @@ RepositoryState LibGit2Backend::snapshot(QString* error) const
         file.submoduleState = submoduleState(_repository, file.path, primary);
         result.files.append(file);
     }
+    result.submodules = submodules(nullptr);
     return result;
 }
 
@@ -1648,6 +1850,83 @@ QString LibGit2Backend::commitDiff(const QString& hash, QString* error) const
     QString patchError;
     const QString patch = diffText(diff.get(), &patchError,
                                    QStringLiteral("Cannot format commit diff."));
+    if (!patchError.isEmpty()) {
+        if (error)
+            *error = patchError;
+        return {};
+    }
+    return output + patch;
+}
+
+QString LibGit2Backend::revisionDiff(const QString& baseRevision,
+                                     const QString& targetRevision,
+                                     QString* error) const
+{
+    if (!ensureRepository(_repository, error))
+        return {};
+
+    CommitHandle baseCommit;
+    if (!lookupCommit(_repository, baseRevision, baseCommit, error,
+                      QStringLiteral("Cannot find base revision.")))
+        return {};
+
+    CommitHandle targetCommit;
+    if (!lookupCommit(_repository, targetRevision, targetCommit, error,
+                      QStringLiteral("Cannot find target revision.")))
+        return {};
+
+    TreeHandle baseTree;
+    if (git_commit_tree(baseTree.out(), baseCommit.get()) < 0) {
+        fail(error, QStringLiteral("Cannot read base revision tree."));
+        return {};
+    }
+
+    TreeHandle targetTree;
+    if (git_commit_tree(targetTree.out(), targetCommit.get()) < 0) {
+        fail(error, QStringLiteral("Cannot read target revision tree."));
+        return {};
+    }
+
+    git_diff_options options = GIT_DIFF_OPTIONS_INIT;
+    options.flags = GIT_DIFF_INCLUDE_TYPECHANGE;
+
+    DiffHandle diff;
+    if (git_diff_tree_to_tree(diff.out(), _repository, baseTree.get(),
+                              targetTree.get(), &options) < 0) {
+        fail(error, QStringLiteral("Cannot create revision diff."));
+        return {};
+    }
+
+    git_diff_find_options findOptions = GIT_DIFF_FIND_OPTIONS_INIT;
+    findOptions.flags = GIT_DIFF_FIND_RENAMES;
+    if (git_diff_find_similar(diff.get(), &findOptions) < 0)
+        git_error_clear();
+
+    const QString resolvedBase = oidText(git_commit_id(baseCommit.get()));
+    const QString resolvedTarget = oidText(git_commit_id(targetCommit.get()));
+
+    QString output;
+    output += QStringLiteral("compare %1..%2\n")
+                  .arg(baseRevision, targetRevision);
+    output += QStringLiteral("Base:   %1\n").arg(resolvedBase);
+    output += QStringLiteral("Target: %1\n\n").arg(resolvedTarget);
+
+    git_diff_stats* stats = nullptr;
+    if (git_diff_get_stats(&stats, diff.get()) == 0) {
+        git_buf statsBuffer = GIT_BUF_INIT;
+        if (git_diff_stats_to_buf(&statsBuffer, stats, GIT_DIFF_STATS_FULL, 80) == 0)
+            output += QString::fromUtf8(statsBuffer.ptr ? statsBuffer.ptr : "",
+                                        static_cast<int>(statsBuffer.size))
+                + QLatin1Char('\n');
+        git_buf_dispose(&statsBuffer);
+        git_diff_stats_free(stats);
+    } else {
+        git_error_clear();
+    }
+
+    QString patchError;
+    const QString patch = diffText(diff.get(), &patchError,
+                                   QStringLiteral("Cannot format revision diff."));
     if (!patchError.isEmpty()) {
         if (error)
             *error = patchError;
@@ -2631,6 +2910,42 @@ bool LibGit2Backend::deleteBranch(const QString& name, bool force,
     return true;
 }
 
+bool LibGit2Backend::renameBranch(const QString& name, const QString& newName,
+                                  QString* error)
+{
+    if (!ensureRepository(_repository, error)
+        || !ensureNoActiveOperation(_repository, error))
+        return false;
+    if (name.trimmed().isEmpty() || newName.trimmed().isEmpty())
+        return fail(error, QStringLiteral("Branch names cannot be empty."));
+
+    ReferenceHandle branch;
+    if (git_branch_lookup(branch.out(), _repository, name.toUtf8().constData(),
+                          GIT_BRANCH_LOCAL) < 0)
+        return fail(error, QStringLiteral("Cannot find local branch."));
+
+    ReferenceHandle renamed;
+    if (git_branch_move(renamed.out(), branch.get(),
+                        newName.toUtf8().constData(), 0) < 0)
+        return fail(error, QStringLiteral("Cannot rename branch."));
+    return true;
+}
+
+bool LibGit2Backend::unsetBranchUpstream(const QString& name, QString* error)
+{
+    if (!ensureRepository(_repository, error)
+        || !ensureNoActiveOperation(_repository, error))
+        return false;
+
+    ReferenceHandle branch;
+    if (git_branch_lookup(branch.out(), _repository, name.toUtf8().constData(),
+                          GIT_BRANCH_LOCAL) < 0)
+        return fail(error, QStringLiteral("Cannot find local branch."));
+    if (git_branch_set_upstream(branch.get(), nullptr) < 0)
+        return fail(error, QStringLiteral("Cannot remove branch upstream."));
+    return true;
+}
+
 bool LibGit2Backend::createTag(const QString& name, const QString& target,
                                const QString& message, QString* error)
 {
@@ -2672,6 +2987,111 @@ bool LibGit2Backend::deleteTag(const QString& name, QString* error)
     return true;
 }
 
+bool LibGit2Backend::pushTag(const QString& remoteName, const QString& tagName,
+                             QString* error)
+{
+    if (!ensureRepository(_repository, error))
+        return false;
+    if (isCancelled()) {
+        if (error)
+            *error = QStringLiteral("Operation cancelled.");
+        return false;
+    }
+    if (remoteName.trimmed().isEmpty() || tagName.trimmed().isEmpty()) {
+        if (error)
+            *error = QStringLiteral("Remote and tag name are required.");
+        return false;
+    }
+
+    ReferenceHandle tagRef;
+    const QByteArray localTagRef = QStringLiteral("refs/tags/%1").arg(tagName).toUtf8();
+    if (git_reference_lookup(tagRef.out(), _repository, localTagRef.constData()) < 0)
+        return fail(error, QStringLiteral("Cannot find local tag."));
+
+    RemoteHandle remote;
+    if (git_remote_lookup(remote.out(), _repository,
+                          remoteName.toUtf8().constData()) < 0)
+        return fail(error, QStringLiteral("Cannot find push remote."));
+
+    NetworkContext context = networkContext(_credentials, _progressCallback,
+                                            _cancelFlag);
+    git_push_options options = GIT_PUSH_OPTIONS_INIT;
+    configureCallbacks(options.callbacks, &context);
+
+    const QByteArray refspecValue = QStringLiteral("refs/tags/%1:refs/tags/%1")
+        .arg(tagName).toUtf8();
+    char* refspecPointer = const_cast<char*>(refspecValue.constData());
+    git_strarray refspecs {&refspecPointer, 1};
+    progress(QStringLiteral("Pushing tag %1").arg(tagName), 0);
+    if (git_remote_push(remote.get(), &refspecs, &options) < 0) {
+        if (error && !context.pushError.isEmpty())
+            *error = context.pushError;
+        else
+            fail(error, isCancelled()
+                ? QStringLiteral("Operation cancelled.")
+                : QStringLiteral("Cannot push tag."));
+        return false;
+    }
+    progress(QStringLiteral("Tag push completed"), 100);
+    return true;
+}
+
+bool LibGit2Backend::deleteRemoteTag(const QString& remoteName,
+                                     const QString& tagName,
+                                     QString* error)
+{
+    if (!ensureRepository(_repository, error))
+        return false;
+    if (isCancelled()) {
+        if (error)
+            *error = QStringLiteral("Operation cancelled.");
+        return false;
+    }
+    if (remoteName.trimmed().isEmpty() || tagName.trimmed().isEmpty()) {
+        if (error)
+            *error = QStringLiteral("Remote and tag name are required.");
+        return false;
+    }
+
+    RemoteHandle remote;
+    if (git_remote_lookup(remote.out(), _repository,
+                          remoteName.toUtf8().constData()) < 0)
+        return fail(error, QStringLiteral("Cannot find push remote."));
+
+    NetworkContext context = networkContext(_credentials, _progressCallback,
+                                            _cancelFlag);
+    git_push_options options = GIT_PUSH_OPTIONS_INIT;
+    configureCallbacks(options.callbacks, &context);
+
+    const QByteArray refspecValue = QStringLiteral(":refs/tags/%1").arg(tagName).toUtf8();
+    char* refspecPointer = const_cast<char*>(refspecValue.constData());
+    git_strarray refspecs {&refspecPointer, 1};
+    progress(QStringLiteral("Deleting remote tag %1").arg(tagName), 0);
+    if (git_remote_push(remote.get(), &refspecs, &options) < 0) {
+        if (error && !context.pushError.isEmpty())
+            *error = context.pushError;
+        else
+            fail(error, isCancelled()
+                ? QStringLiteral("Operation cancelled.")
+                : QStringLiteral("Cannot delete remote tag."));
+        return false;
+    }
+    progress(QStringLiteral("Remote tag deleted"), 100);
+    return true;
+}
+
+bool LibGit2Backend::pruneRemote(const QString& name, QString* error)
+{
+    if (!ensureRepository(_repository, error))
+        return false;
+    if (name.trimmed().isEmpty()) {
+        if (error)
+            *error = QStringLiteral("Remote name is required.");
+        return false;
+    }
+    return fetchRemote(name, true, error);
+}
+
 bool LibGit2Backend::addRemote(const QString& name, const QString& url,
                                QString* error)
 {
@@ -2691,6 +3111,32 @@ bool LibGit2Backend::removeRemote(const QString& name, QString* error)
     if (git_remote_delete(_repository, name.toUtf8().constData()) < 0)
         return fail(error, QStringLiteral("Cannot remove remote."));
     return true;
+}
+
+QVector<RemoteInfo> LibGit2Backend::remotes(QString* error) const
+{
+    QVector<RemoteInfo> result;
+    if (!ensureRepository(_repository, error))
+        return result;
+    git_strarray names = {};
+    if (git_remote_list(&names, _repository) < 0) {
+        fail(error, QStringLiteral("Cannot list remotes."));
+        return result;
+    }
+    for (size_t index = 0; index < names.count; ++index) {
+        RemoteHandle remote;
+        if (git_remote_lookup(remote.out(), _repository, names.strings[index]) < 0) {
+            git_error_clear();
+            continue;
+        }
+        RemoteInfo value;
+        value.name = text(names.strings[index]);
+        value.fetchUrl = text(git_remote_url(remote.get()));
+        value.pushUrl = text(git_remote_pushurl(remote.get()));
+        result.append(value);
+    }
+    git_strarray_dispose(&names);
+    return result;
 }
 
 bool LibGit2Backend::fetchRemote(const QString& name, bool prune,
@@ -2743,7 +3189,7 @@ bool LibGit2Backend::fetchAll(bool prune, QString* error)
 }
 
 bool LibGit2Backend::push(const QString& remoteName, const QString& branchName,
-                          bool setUpstream, QString* error)
+                          bool setUpstream, QString* error, bool forceWithLease)
 {
     if (!ensureRepository(_repository, error))
         return false;
@@ -2804,8 +3250,24 @@ bool LibGit2Backend::push(const QString& remoteName, const QString& branchName,
 
     if (setUpstream)
         remoteBranch = localBranch;
-    const QByteArray refspecValue = QStringLiteral("refs/heads/%1:refs/heads/%2")
-        .arg(localBranch, remoteBranch).toUtf8();
+    const QString trackingRefName = QStringLiteral("refs/remotes/%1/%2")
+        .arg(actualRemote, remoteBranch);
+    if (forceWithLease) {
+        ReferenceHandle tracking;
+        if (git_reference_lookup(tracking.out(), _repository,
+                                 trackingRefName.toUtf8().constData()) < 0
+            || !git_reference_target(tracking.get())) {
+            return fail(error, QStringLiteral(
+                "Force-with-lease requires a fetched remote-tracking branch."));
+        }
+        context.forceWithLease = true;
+        context.leaseDestination = QStringLiteral("refs/heads/%1")
+            .arg(remoteBranch).toUtf8();
+        git_oid_cpy(&context.leaseExpected, git_reference_target(tracking.get()));
+    }
+    const QByteArray refspecValue = QStringLiteral("%1refs/heads/%2:refs/heads/%3")
+        .arg(forceWithLease ? QStringLiteral("+") : QString(),
+             localBranch, remoteBranch).toUtf8();
     char* refspecPointer = const_cast<char*>(refspecValue.constData());
     git_strarray refspecs {&refspecPointer, 1};
     progress(QStringLiteral("Pushing %1").arg(localBranch), 0);
@@ -2819,22 +3281,25 @@ bool LibGit2Backend::push(const QString& remoteName, const QString& branchName,
         return false;
     }
 
+    ReferenceHandle local;
+    if (git_branch_lookup(local.out(), _repository, localBranch.toUtf8().constData(),
+                          GIT_BRANCH_LOCAL) < 0) {
+        return fail(error, QStringLiteral(
+            "Push succeeded, but the local branch could not be refreshed."));
+    }
+    const git_oid* localOid = git_reference_target(local.get());
+    ReferenceHandle tracking;
+    if (!localOid
+        || git_reference_create(tracking.out(), _repository,
+                                trackingRefName.toUtf8().constData(), localOid, 1,
+                                "update by push") < 0) {
+        return fail(error, QStringLiteral(
+            "Push succeeded, but the remote-tracking branch could not be refreshed."));
+    }
+
     if (setUpstream) {
         const QString remoteTracking = actualRemote + QLatin1Char('/') + remoteBranch;
-        const QByteArray localBytes = localBranch.toUtf8();
-        ReferenceHandle local;
-        if (git_branch_lookup(local.out(), _repository, localBytes.constData(),
-                              GIT_BRANCH_LOCAL) < 0)
-            return fail(error, QStringLiteral("Push succeeded, but upstream could not be set."));
-        const git_oid* localOid = git_reference_target(local.get());
-        const QByteArray trackingRef = QStringLiteral("refs/remotes/%1/%2")
-            .arg(actualRemote, remoteBranch).toUtf8();
-        ReferenceHandle tracking;
-        if (!localOid
-            || git_reference_create(tracking.out(), _repository,
-                                    trackingRef.constData(), localOid, 1,
-                                    "update by push") < 0
-            || git_branch_set_upstream(local.get(),
+        if (git_branch_set_upstream(local.get(),
                                        remoteTracking.toUtf8().constData()) < 0)
             return fail(error, QStringLiteral("Push succeeded, but upstream could not be set."));
     }
@@ -2930,6 +3395,553 @@ bool LibGit2Backend::pullRebase(QString* error)
                         upstreamCommit.get(), nullptr, &options) < 0)
         return fail(error, QStringLiteral("Cannot start rebase."));
     return finishRebase(rebase.get(), error);
+}
+
+QVector<WorktreeInfo> LibGit2Backend::worktrees(QString* error) const
+{
+    QVector<WorktreeInfo> result;
+    if (!ensureRepository(_repository, error))
+        return result;
+
+    WorktreeInfo current;
+    current.name = QFileInfo(rootPath()).fileName();
+    current.path = rootPath();
+    current.detached = git_repository_head_detached(_repository) == 1;
+    current.current = true;
+    current.valid = true;
+
+    ReferenceHandle head;
+    if (git_repository_head(head.out(), _repository) == 0) {
+        current.headBranch = current.detached
+            ? QStringLiteral("HEAD")
+            : text(git_reference_shorthand(head.get()));
+        current.headHash = oidText(git_reference_target(head.get()));
+    } else {
+        git_error_clear();
+    }
+    result.append(current);
+
+    git_strarray names {};
+    if (git_worktree_list(&names, _repository) < 0) {
+        fail(error, QStringLiteral("Cannot list worktrees."));
+        return {};
+    }
+
+    for (size_t index = 0; index < names.count; ++index) {
+        const QString name = text(names.strings[index]);
+        WorktreeHandle worktree;
+        if (git_worktree_lookup(worktree.out(), _repository,
+                                name.toUtf8().constData()) < 0) {
+            git_error_clear();
+            continue;
+        }
+        WorktreeInfo info;
+        info.name = name;
+        info.path = resolveWorktreePath(text(git_worktree_path(worktree.get())));
+        info.valid = git_worktree_validate(worktree.get()) == 0;
+        git_error_clear();
+
+        git_buf lockReason = GIT_BUF_INIT;
+        const int locked = git_worktree_is_locked(&lockReason, worktree.get());
+        info.locked = locked == 1;
+        if (info.locked) {
+            info.lockReason = QString::fromUtf8(lockReason.ptr ? lockReason.ptr : "",
+                                                static_cast<int>(lockReason.size));
+        }
+        git_buf_dispose(&lockReason);
+        git_error_clear();
+
+        git_repository* rawWorktreeRepo = nullptr;
+        if (git_repository_open_from_worktree(&rawWorktreeRepo, worktree.get()) == 0) {
+            GitHandle<git_repository, git_repository_free> worktreeRepo(rawWorktreeRepo);
+            info.detached = git_repository_head_detached(worktreeRepo.get()) == 1;
+            ReferenceHandle worktreeHead;
+            if (git_repository_head(worktreeHead.out(), worktreeRepo.get()) == 0) {
+                info.headBranch = info.detached
+                    ? QStringLiteral("HEAD")
+                    : text(git_reference_shorthand(worktreeHead.get()));
+                info.headHash = oidText(git_reference_target(worktreeHead.get()));
+            } else {
+                git_error_clear();
+            }
+        } else {
+            git_error_clear();
+        }
+        result.append(info);
+    }
+    git_strarray_dispose(&names);
+    return result;
+}
+
+bool LibGit2Backend::addWorktree(const QString& name, const QString& path,
+                                 const QString& branchName, QString* error)
+{
+    if (!ensureRepository(_repository, error)
+        || !ensureNoActiveOperation(_repository, error))
+        return false;
+    if (name.trimmed().isEmpty() || path.trimmed().isEmpty()) {
+        if (error)
+            *error = QStringLiteral("Worktree name and path are required.");
+        return false;
+    }
+
+    git_worktree_add_options options = GIT_WORKTREE_ADD_OPTIONS_INIT;
+    if (!branchName.trimmed().isEmpty()) {
+        ReferenceHandle branch;
+        if (git_branch_lookup(branch.out(), _repository, branchName.toUtf8().constData(),
+                              GIT_BRANCH_LOCAL) < 0)
+            return fail(error, QStringLiteral("Cannot find worktree branch."));
+        options.ref = branch.get();
+        options.checkout_existing = 1;
+        WorktreeHandle worktree;
+        if (git_worktree_add(worktree.out(), _repository, name.toUtf8().constData(),
+                             path.toUtf8().constData(), &options) < 0)
+            return fail(error, QStringLiteral("Cannot create worktree."));
+        return true;
+    }
+
+    WorktreeHandle worktree;
+    if (git_worktree_add(worktree.out(), _repository, name.toUtf8().constData(),
+                         path.toUtf8().constData(), nullptr) < 0)
+        return fail(error, QStringLiteral("Cannot create worktree."));
+    return true;
+}
+
+bool LibGit2Backend::moveWorktree(const QString& name, const QString& path,
+                                  QString* error)
+{
+    if (!ensureRepository(_repository, error)
+        || !ensureNoActiveOperation(_repository, error))
+        return false;
+    if (name.trimmed().isEmpty() || path.trimmed().isEmpty()) {
+        if (error)
+            *error = QStringLiteral("Worktree name and target path are required.");
+        return false;
+    }
+
+    WorktreeHandle worktree;
+    if (git_worktree_lookup(worktree.out(), _repository, name.toUtf8().constData()) < 0)
+        return fail(error, QStringLiteral("Cannot find worktree."));
+
+    git_buf lockReason = GIT_BUF_INIT;
+    const int locked = git_worktree_is_locked(&lockReason, worktree.get());
+    git_buf_dispose(&lockReason);
+    if (locked == 1) {
+        if (error)
+            *error = QStringLiteral("Unlock the worktree before moving it.");
+        return false;
+    }
+    if (locked < 0) {
+        git_error_clear();
+        return fail(error, QStringLiteral("Cannot inspect worktree lock state."));
+    }
+
+    const QString sourcePath = resolveWorktreePath(text(git_worktree_path(worktree.get())));
+    const QString targetPath = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+    if (sourcePath.isEmpty()) {
+        if (error)
+            *error = QStringLiteral("Cannot resolve worktree path.");
+        return false;
+    }
+    if (sourcePath.compare(targetPath, Qt::CaseInsensitive) == 0)
+        return true;
+    if (!QFileInfo::exists(sourcePath)) {
+        if (error)
+            *error = QStringLiteral("Source worktree directory does not exist.");
+        return false;
+    }
+
+    const QString commonDir = QDir::cleanPath(text(git_repository_commondir(_repository)));
+    const QString gitdirFile = QDir(commonDir).filePath(
+        QStringLiteral("worktrees/%1/gitdir").arg(name));
+    if (!QFileInfo::exists(gitdirFile)) {
+        if (error)
+            *error = QStringLiteral("Cannot find worktree metadata.");
+        return false;
+    }
+
+    if (!moveDirectoryRecursively(sourcePath, targetPath, error))
+        return false;
+
+    const QString movedGitFile = QDir(targetPath).filePath(QStringLiteral(".git"));
+    if (!writeTextFile(gitdirFile,
+                       QDir::fromNativeSeparators(movedGitFile) + QLatin1Char('\n'),
+                       error)) {
+        return false;
+    }
+
+    const QString repositoryRoot = rootPath();
+    close();
+    if (!open(repositoryRoot, error))
+        return false;
+    return true;
+}
+
+bool LibGit2Backend::lockWorktree(const QString& name, const QString& reason,
+                                  QString* error)
+{
+    if (!ensureRepository(_repository, error)
+        || !ensureNoActiveOperation(_repository, error))
+        return false;
+    if (name.trimmed().isEmpty()) {
+        if (error)
+            *error = QStringLiteral("Worktree name is required.");
+        return false;
+    }
+
+    WorktreeHandle worktree;
+    if (git_worktree_lookup(worktree.out(), _repository, name.toUtf8().constData()) < 0)
+        return fail(error, QStringLiteral("Cannot find worktree."));
+    if (git_worktree_lock(worktree.get(), reason.trimmed().toUtf8().constData()) < 0)
+        return fail(error, QStringLiteral("Cannot lock worktree."));
+    return true;
+}
+
+bool LibGit2Backend::unlockWorktree(const QString& name, QString* error)
+{
+    if (!ensureRepository(_repository, error)
+        || !ensureNoActiveOperation(_repository, error))
+        return false;
+    if (name.trimmed().isEmpty()) {
+        if (error)
+            *error = QStringLiteral("Worktree name is required.");
+        return false;
+    }
+
+    WorktreeHandle worktree;
+    if (git_worktree_lookup(worktree.out(), _repository, name.toUtf8().constData()) < 0)
+        return fail(error, QStringLiteral("Cannot find worktree."));
+    const int rc = git_worktree_unlock(worktree.get());
+    if (rc < 0)
+        return fail(error, QStringLiteral("Cannot unlock worktree."));
+    return true;
+}
+
+bool LibGit2Backend::removeWorktree(const QString& name, bool force,
+                                    QString* error)
+{
+    if (!ensureRepository(_repository, error)
+        || !ensureNoActiveOperation(_repository, error))
+        return false;
+    if (name.trimmed().isEmpty()) {
+        if (error)
+            *error = QStringLiteral("Worktree name is required.");
+        return false;
+    }
+
+    WorktreeHandle worktree;
+    if (git_worktree_lookup(worktree.out(), _repository, name.toUtf8().constData()) < 0)
+        return fail(error, QStringLiteral("Cannot find worktree."));
+
+    git_worktree_prune_options options = GIT_WORKTREE_PRUNE_OPTIONS_INIT;
+    options.flags = force
+        ? (GIT_WORKTREE_PRUNE_VALID
+           | GIT_WORKTREE_PRUNE_LOCKED
+           | GIT_WORKTREE_PRUNE_WORKING_TREE)
+        : 0;
+    const int prunable = git_worktree_is_prunable(worktree.get(), &options);
+    if (prunable == 1) {
+        if (git_worktree_prune(worktree.get(), &options) < 0)
+            return fail(error, QStringLiteral("Cannot prune worktree metadata."));
+        return true;
+    }
+    git_error_clear();
+
+    const QString worktreePath = resolveWorktreePath(text(git_worktree_path(worktree.get())));
+    if (!worktreePath.isEmpty()) {
+        QDir dir(worktreePath);
+        if (dir.exists() && !dir.removeRecursively()) {
+            if (error)
+                *error = QStringLiteral("Cannot remove worktree directory.");
+            return false;
+        }
+    }
+    if (git_worktree_prune(worktree.get(), &options) < 0)
+        return fail(error, QStringLiteral("Cannot remove worktree."));
+    return true;
+}
+
+QVector<SubmoduleInfo> LibGit2Backend::submodules(QString* error) const
+{
+    QVector<SubmoduleInfo> result;
+    if (!ensureRepository(_repository, error))
+        return result;
+
+    // Discovery refreshes libgit2's cached index/config state. Inspect through
+    // a separate handle so the backend's status and history views stay stable.
+    RepositoryHandle inspectionRepository;
+    const QByteArray repositoryPath = rootPath().toUtf8();
+    if (git_repository_open(inspectionRepository.out(),
+                            repositoryPath.constData()) < 0) {
+        fail(error, QStringLiteral("Cannot open repository for submodule inspection."));
+        return result;
+    }
+
+    struct Context {
+        git_repository* repository {nullptr};
+        QVector<SubmoduleInfo>* values {nullptr};
+    } context {inspectionRepository.get(), &result};
+
+    const int rc = git_submodule_foreach(
+        inspectionRepository.get(),
+        [](git_submodule* submodule, const char*, void* payload) -> int {
+            auto* context = static_cast<Context*>(payload);
+            SubmoduleInfo value;
+            value.name = text(git_submodule_name(submodule));
+            value.path = text(git_submodule_path(submodule));
+            value.url = text(git_submodule_url(submodule));
+            value.branch = text(git_submodule_branch(submodule));
+            value.indexHash = oidText(git_submodule_index_id(submodule));
+            value.workdirHash = oidText(git_submodule_wd_id(submodule));
+
+            unsigned int status = 0;
+            const QByteArray name = value.name.toUtf8();
+            if (git_submodule_status(&status, context->repository,
+                                     name.constData(),
+                                     GIT_SUBMODULE_IGNORE_NONE) == 0) {
+                if ((status & GIT_SUBMODULE_STATUS_INDEX_DELETED)
+                    && !(status & (GIT_SUBMODULE_STATUS_IN_INDEX
+                                   | GIT_SUBMODULE_STATUS_IN_CONFIG
+                                   | GIT_SUBMODULE_STATUS_IN_WD))) {
+                    return 0;
+                }
+                value.initialized = (status & GIT_SUBMODULE_STATUS_IN_WD)
+                    && !(status & GIT_SUBMODULE_STATUS_WD_UNINITIALIZED);
+                value.dirty = !GIT_SUBMODULE_STATUS_IS_UNMODIFIED(status);
+            } else {
+                git_error_clear();
+            }
+            context->values->append(value);
+            return 0;
+        },
+        &context);
+    if (rc < 0) {
+        fail(error, QStringLiteral("Cannot list submodules."));
+        result.clear();
+    }
+    std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
+        return left.path.compare(right.path, Qt::CaseInsensitive) < 0;
+    });
+    return result;
+}
+
+bool LibGit2Backend::addSubmodule(const QString& url, const QString& path,
+                                  QString* error)
+{
+    if (!ensureRepository(_repository, error)
+        || !ensureNoActiveOperation(_repository, error))
+        return false;
+    const QString normalizedPath = QDir::cleanPath(
+        QDir::fromNativeSeparators(path.trimmed()));
+    if (url.trimmed().isEmpty() || normalizedPath.isEmpty()
+        || QDir::isAbsolutePath(normalizedPath)
+        || normalizedPath == QStringLiteral("..")
+        || normalizedPath.startsWith(QStringLiteral("../"))) {
+        if (error)
+            *error = QStringLiteral("A URL and a repository-relative submodule path are required.");
+        return false;
+    }
+
+    SubmoduleHandle submodule;
+    const QByteArray urlBytes = url.trimmed().toUtf8();
+    const QByteArray pathBytes = normalizedPath.toUtf8();
+    if (git_submodule_add_setup(submodule.out(), _repository,
+                                urlBytes.constData(), pathBytes.constData(), 1) < 0)
+        return fail(error, QStringLiteral("Cannot prepare submodule."));
+
+    NetworkContext context = networkContext(_credentials, _progressCallback,
+                                            _cancelFlag);
+    git_submodule_update_options options = GIT_SUBMODULE_UPDATE_OPTIONS_INIT;
+    options.checkout_opts.checkout_strategy = GIT_CHECKOUT_SAFE
+        | GIT_CHECKOUT_RECREATE_MISSING;
+    configureCallbacks(options.fetch_opts.callbacks, &context);
+    RepositoryHandle cloned;
+    progress(QStringLiteral("Cloning submodule %1").arg(normalizedPath));
+    if (git_submodule_clone(cloned.out(), submodule.get(), &options) < 0)
+        return fail(error, isCancelled()
+            ? QStringLiteral("Operation cancelled.")
+            : QStringLiteral("Cannot clone submodule."));
+    if (git_submodule_add_finalize(submodule.get()) < 0)
+        return fail(error, QStringLiteral("Cannot finalize submodule."));
+    progress(QStringLiteral("Submodule added"), 100);
+    return true;
+}
+
+bool LibGit2Backend::updateSubmodule(const QString& name, QString* error)
+{
+    if (!ensureRepository(_repository, error)
+        || !ensureNoActiveOperation(_repository, error))
+        return false;
+    if (name.trimmed().isEmpty()) {
+        if (error)
+            *error = QStringLiteral("Submodule name is required.");
+        return false;
+    }
+
+    SubmoduleHandle submodule;
+    const QByteArray nameBytes = name.trimmed().toUtf8();
+    if (git_submodule_lookup(submodule.out(), _repository,
+                             nameBytes.constData()) < 0)
+        return fail(error, QStringLiteral("Cannot find submodule."));
+
+    NetworkContext context = networkContext(_credentials, _progressCallback,
+                                            _cancelFlag);
+    git_submodule_update_options options = GIT_SUBMODULE_UPDATE_OPTIONS_INIT;
+    options.checkout_opts.checkout_strategy = GIT_CHECKOUT_SAFE
+        | GIT_CHECKOUT_RECREATE_MISSING;
+    configureCallbacks(options.fetch_opts.callbacks, &context);
+    progress(QStringLiteral("Updating submodule %1").arg(name));
+    if (git_submodule_update(submodule.get(), 1, &options) < 0)
+        return fail(error, isCancelled()
+            ? QStringLiteral("Operation cancelled.")
+            : QStringLiteral("Cannot update submodule."));
+    progress(QStringLiteral("Submodule updated"), 100);
+    return true;
+}
+
+bool LibGit2Backend::syncSubmodule(const QString& name, QString* error)
+{
+    if (!ensureRepository(_repository, error)
+        || !ensureNoActiveOperation(_repository, error))
+        return false;
+    if (name.trimmed().isEmpty()) {
+        if (error)
+            *error = QStringLiteral("Submodule name is required.");
+        return false;
+    }
+    SubmoduleHandle submodule;
+    const QByteArray nameBytes = name.trimmed().toUtf8();
+    if (git_submodule_lookup(submodule.out(), _repository,
+                             nameBytes.constData()) < 0)
+        return fail(error, QStringLiteral("Cannot find submodule."));
+    if (git_submodule_sync(submodule.get()) < 0)
+        return fail(error, QStringLiteral("Cannot synchronize submodule settings."));
+    return true;
+}
+
+bool LibGit2Backend::setSubmoduleBranch(const QString& name,
+                                        const QString& branch,
+                                        QString* error)
+{
+    if (!ensureRepository(_repository, error)
+        || !ensureNoActiveOperation(_repository, error))
+        return false;
+    if (name.trimmed().isEmpty()) {
+        if (error)
+            *error = QStringLiteral("Submodule name is required.");
+        return false;
+    }
+    const QByteArray nameBytes = name.trimmed().toUtf8();
+    const QByteArray branchBytes = branch.trimmed().toUtf8();
+    if (git_submodule_set_branch(_repository, nameBytes.constData(),
+                                 branchBytes.isEmpty()
+                                     ? nullptr : branchBytes.constData()) < 0)
+        return fail(error, QStringLiteral("Cannot set submodule branch."));
+
+    SubmoduleHandle submodule;
+    if (git_submodule_lookup(submodule.out(), _repository,
+                             nameBytes.constData()) < 0)
+        return fail(error, QStringLiteral("Cannot reload submodule."));
+    if (git_submodule_sync(submodule.get()) < 0)
+        return fail(error, QStringLiteral("Cannot synchronize submodule settings."));
+
+    IndexHandle index;
+    if (git_repository_index(index.out(), _repository) < 0
+        || git_index_add_bypath(index.get(), ".gitmodules") < 0
+        || git_index_write(index.get()) < 0)
+        return fail(error, QStringLiteral("Cannot stage submodule branch configuration."));
+    return true;
+}
+
+bool LibGit2Backend::removeSubmodule(const QString& name, bool force,
+                                     QString* error)
+{
+    if (!ensureRepository(_repository, error)
+        || !ensureNoActiveOperation(_repository, error))
+        return false;
+    if (name.trimmed().isEmpty()) {
+        if (error)
+            *error = QStringLiteral("Submodule name is required.");
+        return false;
+    }
+
+    const QByteArray nameBytes = name.trimmed().toUtf8();
+    SubmoduleHandle submodule;
+    if (git_submodule_lookup(submodule.out(), _repository,
+                             nameBytes.constData()) < 0)
+        return fail(error, QStringLiteral("Cannot find submodule."));
+    const QString path = QDir::cleanPath(text(git_submodule_path(submodule.get())));
+    if (path.isEmpty() || QDir::isAbsolutePath(path)
+        || path == QStringLiteral("..")
+        || path.startsWith(QStringLiteral("../"))) {
+        if (error)
+            *error = QStringLiteral("Submodule path is unsafe.");
+        return false;
+    }
+    const QString repositoryRoot = QDir::cleanPath(rootPath());
+    const QString workdirPath = QDir::cleanPath(
+        QFileInfo(QDir(repositoryRoot).filePath(path)).absoluteFilePath());
+    const QString repositoryPrefix = repositoryRoot + QLatin1Char('/');
+    if (!workdirPath.startsWith(repositoryPrefix, Qt::CaseInsensitive)) {
+        if (error)
+            *error = QStringLiteral("Submodule path escapes the repository.");
+        return false;
+    }
+
+    unsigned int status = 0;
+    if (git_submodule_status(&status, _repository, nameBytes.constData(),
+                             GIT_SUBMODULE_IGNORE_NONE) < 0)
+        return fail(error, QStringLiteral("Cannot inspect submodule status."));
+    if (!force && !GIT_SUBMODULE_STATUS_IS_UNMODIFIED(status)) {
+        if (error)
+            *error = QStringLiteral("Submodule has staged or working directory changes.");
+        return false;
+    }
+
+    const QString modulesFile = QDir(repositoryRoot).filePath(QStringLiteral(".gitmodules"));
+    if (QFileInfo::exists(modulesFile)) {
+        ConfigHandle modulesConfig;
+        if (git_config_open_ondisk(modulesConfig.out(),
+                                   modulesFile.toUtf8().constData()) < 0
+            || !deleteConfigSection(modulesConfig.get(), name.trimmed(), error))
+            return fail(error, QStringLiteral("Cannot update .gitmodules."));
+    }
+
+    ConfigHandle repositoryConfig;
+    if (git_repository_config(repositoryConfig.out(), _repository) < 0
+        || !deleteConfigSection(repositoryConfig.get(), name.trimmed(), error))
+        return fail(error, QStringLiteral("Cannot update repository configuration."));
+
+    IndexHandle index;
+    const QByteArray pathBytes = path.toUtf8();
+    if (git_repository_index(index.out(), _repository) < 0
+        || git_index_remove_bypath(index.get(), pathBytes.constData()) < 0)
+        return fail(error, QStringLiteral("Cannot remove submodule from index."));
+    if (QFileInfo::exists(modulesFile)
+        && git_index_add_bypath(index.get(), ".gitmodules") < 0)
+        return fail(error, QStringLiteral("Cannot stage .gitmodules."));
+    if (git_index_write(index.get()) < 0)
+        return fail(error, QStringLiteral("Cannot write repository index."));
+
+    if (QDir(workdirPath).exists() && !QDir(workdirPath).removeRecursively()) {
+        if (error)
+            *error = QStringLiteral("Cannot remove submodule working directory.");
+        return false;
+    }
+
+    const QString commonDir = QDir::cleanPath(text(git_repository_commondir(_repository)));
+    const QString modulesRoot = QDir(commonDir).filePath(QStringLiteral("modules"));
+    const QString metadataPath = QDir(modulesRoot).filePath(name.trimmed());
+    const QString rootPrefix = QDir::cleanPath(modulesRoot) + QLatin1Char('/');
+    const QString cleanMetadata = QDir::cleanPath(metadataPath);
+    if (cleanMetadata.startsWith(rootPrefix, Qt::CaseInsensitive)
+        && QDir(cleanMetadata).exists()
+        && !QDir(cleanMetadata).removeRecursively()) {
+        if (error)
+            *error = QStringLiteral("Cannot remove submodule metadata.");
+        return false;
+    }
+    return true;
 }
 
 QStringList LibGit2Backend::stashes(QString* error) const

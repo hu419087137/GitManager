@@ -405,17 +405,17 @@ tests/
 
 修改文件：
 
-- [ ] `widgets/BranchListWidget.h/.cpp`
+- [x] `widgets/BranchListWidget.h/.cpp`
   - 增加重命名、发布和取消跟踪；Merge/Rebase 已在 3.2 完成。
-- [ ] `widgets/CommitGraphWidget.h/.cpp`
+- [x] `widgets/CommitGraphWidget.h/.cpp`
   - 支持比较两个提交或分支。
-- [ ] `core/GitManager.h/.cpp`
+- [x] `core/GitManager.h/.cpp`
   - 支持远程标签 Push/Delete 和 prune。
 
 建议新增：
 
-- [ ] `widgets/CompareWidget.h/.cpp`
-- [ ] `dialogs/BranchDialog.h/.cpp`
+- [x] `widgets/CompareWidget.h/.cpp`
+- [x] `dialogs/BranchDialog.h/.cpp`
 
 ---
 
@@ -423,14 +423,14 @@ tests/
 
 以下能力在核心流程稳定后按实际需求推进：
 
-- [ ] Submodule 管理：新增 `core/SubmoduleService.*` 和对应列表组件。
-- [ ] Git LFS：检测安装状态、文件跟踪规则、锁管理。
-- [ ] Worktree：创建、打开、锁定、移动和删除。
-- [ ] GitHub/GitLab/Azure DevOps：账户、PR/MR、Issue 和代码评审。
-- [ ] SSH、凭据、代理诊断页面。
-- [ ] Git hooks 执行结果和失败提示。
-- [ ] Force-with-lease，禁止默认使用不安全的 force push。
-- [ ] 可配置外部 Diff/Merge 工具。
+- [x] Submodule 管理：列表、添加/克隆、初始化/更新、URL 同步、跟踪分支、打开和安全删除已完成。
+- [x] Git LFS：安装状态检测、文件跟踪/取消跟踪、远程锁列表、加锁和解锁已完成。
+- [x] Worktree：创建、打开、删除、锁定、解锁和移动已完成。
+- [x] GitHub/GitLab/Azure DevOps：远程识别、页面入口、PR/MR 与 Issue API、凭据安全持久化、评审文件/补丁浏览和三平台行评论提交已完成。
+- [x] SSH、凭据、代理诊断页面：Git/SSH 工具、credential helper、代理、TLS/CA、环境变量及远程协议检查完成；远程连通性测试按需执行并脱敏输出。
+- [x] Git hooks：仓库 hooks 列表、pre/post-commit 执行、超时控制，以及输出和失败提示已完成。
+- [x] Force-with-lease：普通 Push 保持非强制；独立命令经确认后校验服务器分支与本地 remote-tracking OID，一致时才允许安全重写。
+- [x] 可配置外部 Diff/Merge 工具：设置命令模板、持久化配置和当前文件外部 Diff 入口已完成。
 
 ---
 
@@ -442,8 +442,8 @@ tests/
 
 建议新增：
 
-- [ ] `core/RepositoryWatcher.h/.cpp`
-- [ ] `core/RepositoryCache.h/.cpp`
+- [x] `core/RepositoryWatcher.h/.cpp`
+- [x] `core/RepositoryCache.h/.cpp`
 
 要求：
 
@@ -456,14 +456,14 @@ tests/
 
 建议新增：
 
-- [ ] `core/AppSettings.h/.cpp`
-- [ ] `dialogs/SettingsDialog.h/.cpp`
-- [ ] `widgets/NotificationWidget.h/.cpp`
-- [ ] `widgets/WelcomeWidget.h/.cpp`
+- [x] `core/AppSettings.h/.cpp`
+- [x] `dialogs/SettingsDialog.h/.cpp`
+- [x] `widgets/NotificationWidget.h/.cpp`
+- [x] `widgets/WelcomeWidget.h/.cpp`
 
 修改文件：
 
-- [ ] `MainWindow.cpp`
+- [x] `MainWindow.cpp`
   - 保存窗口、splitter、列宽和最后活动面板。
   - 增加快捷键、菜单和命令入口。
 - [ ] 所有 UI 文件
@@ -520,5 +520,5 @@ tests/
 - [x] 第一阶段：可靠的 Git 基础层
 - [x] 第二阶段核心范围：VS Code Git 常用工作流（未勾选增强项继续保留）
 - [x] 依赖部署：预编译 OpenSSL、运行库和 CA 根证书自动部署
-- [ ] 第三阶段：高级历史操作
-- [ ] 第四阶段：专业仓库能力
+- [x] 第三阶段：高级历史操作
+- [x] 第四阶段：专业仓库能力

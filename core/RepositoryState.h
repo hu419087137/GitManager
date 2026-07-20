@@ -18,6 +18,8 @@ struct RepositoryState {
     RepositoryOperation activeOperation {RepositoryOperation::None};
     QString refsVersion;
     QVector<Branch> branches;
+    QVector<WorktreeInfo> worktrees;
+    QVector<SubmoduleInfo> submodules;
     QVector<File> files;
 
     QString displayHead() const;

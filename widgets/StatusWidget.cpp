@@ -5,6 +5,7 @@
 #include <QListWidget>
 #include <QMenu>
 #include <QPushButton>
+#include <QScrollBar>
 #include <QVBoxLayout>
 
 namespace {
@@ -34,6 +35,9 @@ StatusWidget::StatusWidget(QWidget* parent) : QWidget(parent)
     _stageAllBtn = new QPushButton(QStringLiteral("Stage All"), this);
     _unstageAllBtn = new QPushButton(QStringLiteral("Unstage All"), this);
     _list->setContextMenuPolicy(Qt::CustomContextMenu);
+    _list->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    _list->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
+    _list->setTextElideMode(Qt::ElideNone);
 
     auto* buttons = new QHBoxLayout;
     buttons->addWidget(_stageAllBtn);

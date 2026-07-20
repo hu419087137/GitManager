@@ -1,10 +1,16 @@
 #include "GitManager.h"
+#include "LfsService.h"
+#include "HostingService.h"
+#include "HostingApiService.h"
+#include "GitDiagnosticService.h"
+#include "HookService.h"
 
 #include <QtConcurrent>
 #include <QDir>
 #include <QFile>
 #include <QFutureWatcher>
 #include <QPointer>
+#include <QDateTime>
 #include <QRegularExpression>
 #include <QTextStream>
 
@@ -14,6 +20,8 @@ namespace {
 
 QString operationLabel(const QString& operation)
 {
+    if (operation.startsWith(QStringLiteral("lfs-")))
+        return QStringLiteral("git lfs: %1").arg(operation.mid(4));
     return QStringLiteral("libgit2: %1").arg(operation);
 }
 
@@ -29,6 +37,13 @@ GitManager::GitManager(QObject* parent)
     qRegisterMetaType<HistoryRewritePreview>();
     qRegisterMetaType<RebasePlan>();
     qRegisterMetaType<HistoryOperationStatus>();
+    qRegisterMetaType<LfsState>();
+    qRegisterMetaType<QVector<HostingRemoteInfo>>();
+    qRegisterMetaType<QVector<HostingChangeInfo>>();
+    qRegisterMetaType<QVector<HostingIssueInfo>>();
+    qRegisterMetaType<QVector<HostingReviewFile>>();
+    qRegisterMetaType<GitDiagnosticReport>();
+    qRegisterMetaType<HookResult>();
 }
 
 GitManager::~GitManager()
@@ -209,6 +224,7 @@ void GitManager::runHistoryOperation(
 void GitManager::openRepository(const QString& path)
 {
     cancelAll();
+    _cache.clear();
     _repoPath = QDir(path).absolutePath();
     _isValid = false;
     ++_generation;
@@ -233,6 +249,7 @@ void GitManager::openRepository(const QString& path)
 void GitManager::initRepository(const QString& path)
 {
     cancelAll();
+    _cache.clear();
     _repoPath = QDir(path).absolutePath();
     _isValid = false;
     ++_generation;
@@ -254,6 +271,7 @@ void GitManager::initRepository(const QString& path)
 void GitManager::cloneRepository(const QString& url, const QString& path)
 {
     cancelAll();
+    _cache.clear();
     _repoPath = QDir(path).absolutePath();
     _isValid = false;
     ++_generation;
@@ -280,6 +298,29 @@ void GitManager::refresh()
         TaskResult result;
         const RepositoryState state = backend.snapshot(&result.error);
         result.apply = [state](GitManager& manager) {
+            manager._cache.storeState(manager._repoPath, state,
+                                      QDateTime::currentMSecsSinceEpoch());
+            manager.publishState(state);
+        };
+        return result;
+    }, true, false, false, true, true);
+}
+
+void GitManager::refreshFromWatcher()
+{
+    if (!_isValid)
+        return;
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    RepositoryState cachedState;
+    if (_cache.tryGetState(_repoPath, nowMs, &cachedState)) {
+        publishState(cachedState);
+        return;
+    }
+    enqueue(QStringLiteral("refresh"), [repoPath = _repoPath, nowMs](LibGit2Backend& backend) {
+        TaskResult result;
+        const RepositoryState state = backend.snapshot(&result.error);
+        result.apply = [state, repoPath, nowMs](GitManager& manager) {
+            manager._cache.storeState(repoPath, state, nowMs);
             manager.publishState(state);
         };
         return result;
@@ -291,6 +332,7 @@ void GitManager::cancelAll()
     if (_activeCancelFlag)
         _activeCancelFlag->store(true);
     _tasks.clear();
+    _cache.clear();
     ++_generation;
     resetCommitHistoryState();
     ++_diffRequest;
@@ -580,6 +622,27 @@ void GitManager::fetchCommitDiff(const QString& hash)
     });
 }
 
+void GitManager::fetchRevisionDiff(const QString& baseRevision,
+                                   const QString& targetRevision)
+{
+    cancelDiffRequest();
+    const quint64 requestId = _diffRequest;
+    enqueue(QStringLiteral("diff-compare"),
+            [baseRevision, targetRevision, requestId](LibGit2Backend& backend) {
+        TaskResult result;
+        const QString diff = backend.revisionDiff(baseRevision, targetRevision,
+                                                  &result.error);
+        result.apply = [diff, baseRevision, targetRevision, requestId](GitManager& manager) {
+            if (requestId != manager._diffRequest)
+                return;
+            emit manager.sigDiffReady(
+                diff, QStringLiteral("%1..%2").arg(baseRevision, targetRevision),
+                false, false);
+        };
+        return result;
+    });
+}
+
 void GitManager::stageFile(const QString& path)
 {
     runBoolean(QStringLiteral("stage"), [path](auto& backend, auto* error) {
@@ -631,9 +694,30 @@ void GitManager::applyPatch(const QString& patch, bool cached, bool reverse)
 
 void GitManager::commit(const QString& message, bool amend, bool signoff)
 {
-    runBoolean(QStringLiteral("commit"), [message, amend, signoff](auto& backend, auto* error) {
-        return backend.commit(message, amend, signoff, error);
-    });
+    enqueue(QStringLiteral("commit"),
+            [message, amend, signoff](LibGit2Backend& backend) {
+        TaskResult result;
+        HookService hooks(backend.rootPath());
+        const HookResult preCommit = hooks.run(QStringLiteral("pre-commit"));
+        if (!preCommit.success) {
+            result.error = QStringLiteral("pre-commit hook failed (exit %1).\n%2")
+                .arg(preCommit.exitCode).arg(preCommit.output);
+            result.applyOnError = true;
+            result.apply = [preCommit](GitManager& manager) {
+                emit manager.sigHookFinished(preCommit);
+            };
+            return result;
+        }
+        if (!backend.commit(message, amend, signoff, &result.error))
+            return result;
+        const HookResult postCommit = hooks.run(QStringLiteral("post-commit"));
+        result.apply = [preCommit, postCommit](GitManager& manager) {
+            if (!preCommit.output.isEmpty()) emit manager.sigHookFinished(preCommit);
+            if (!postCommit.output.isEmpty() || !postCommit.success)
+                emit manager.sigHookFinished(postCommit);
+        };
+        return result;
+    }, true, true, true);
 }
 
 void GitManager::checkoutBranch(const QString& name)
@@ -657,6 +741,20 @@ void GitManager::deleteBranch(const QString& name, bool force)
     });
 }
 
+void GitManager::renameBranch(const QString& name, const QString& newName)
+{
+    runBoolean(QStringLiteral("rename-branch"), [name, newName](auto& backend, auto* error) {
+        return backend.renameBranch(name, newName, error);
+    });
+}
+
+void GitManager::unsetBranchUpstream(const QString& name)
+{
+    runBoolean(QStringLiteral("unset-upstream"), [name](auto& backend, auto* error) {
+        return backend.unsetBranchUpstream(name, error);
+    });
+}
+
 void GitManager::createTag(const QString& name, const QString& hash, const QString& message)
 {
     runBoolean(QStringLiteral("create-tag"), [name, hash, message](auto& backend, auto* error) {
@@ -668,6 +766,27 @@ void GitManager::deleteTag(const QString& name)
 {
     runBoolean(QStringLiteral("delete-tag"), [name](auto& backend, auto* error) {
         return backend.deleteTag(name, error);
+    });
+}
+
+void GitManager::pushTag(const QString& remote, const QString& tagName)
+{
+    runBoolean(QStringLiteral("push-tag"), [remote, tagName](auto& backend, auto* error) {
+        return backend.pushTag(remote, tagName, error);
+    });
+}
+
+void GitManager::deleteRemoteTag(const QString& remote, const QString& tagName)
+{
+    runBoolean(QStringLiteral("delete-remote-tag"), [remote, tagName](auto& backend, auto* error) {
+        return backend.deleteRemoteTag(remote, tagName, error);
+    });
+}
+
+void GitManager::pruneRemote(const QString& name)
+{
+    runBoolean(QStringLiteral("prune-remote"), [name](auto& backend, auto* error) {
+        return backend.pruneRemote(name, error);
     });
 }
 
@@ -683,6 +802,272 @@ void GitManager::removeRemote(const QString& name)
     runBoolean(QStringLiteral("remove-remote"), [name](auto& backend, auto* error) {
         return backend.removeRemote(name, error);
     });
+}
+
+void GitManager::addWorktree(const QString& name, const QString& path,
+                             const QString& branchName)
+{
+    runBoolean(QStringLiteral("add-worktree"), [name, path, branchName](auto& backend, auto* error) {
+        return backend.addWorktree(name, path, branchName, error);
+    });
+}
+
+void GitManager::moveWorktree(const QString& name, const QString& path)
+{
+    runBoolean(QStringLiteral("move-worktree"), [name, path](auto& backend, auto* error) {
+        return backend.moveWorktree(name, path, error);
+    });
+}
+
+void GitManager::lockWorktree(const QString& name, const QString& reason)
+{
+    runBoolean(QStringLiteral("lock-worktree"), [name, reason](auto& backend, auto* error) {
+        return backend.lockWorktree(name, reason, error);
+    });
+}
+
+void GitManager::unlockWorktree(const QString& name)
+{
+    runBoolean(QStringLiteral("unlock-worktree"), [name](auto& backend, auto* error) {
+        return backend.unlockWorktree(name, error);
+    });
+}
+
+void GitManager::removeWorktree(const QString& name, bool force)
+{
+    runBoolean(QStringLiteral("remove-worktree"), [name, force](auto& backend, auto* error) {
+        return backend.removeWorktree(name, force, error);
+    });
+}
+
+void GitManager::addSubmodule(const QString& url, const QString& path)
+{
+    runBoolean(QStringLiteral("add-submodule"), [url, path](auto& backend, auto* error) {
+        return backend.addSubmodule(url, path, error);
+    });
+}
+
+void GitManager::updateSubmodule(const QString& name)
+{
+    runBoolean(QStringLiteral("update-submodule"), [name](auto& backend, auto* error) {
+        return backend.updateSubmodule(name, error);
+    });
+}
+
+void GitManager::syncSubmodule(const QString& name)
+{
+    runBoolean(QStringLiteral("sync-submodule"), [name](auto& backend, auto* error) {
+        return backend.syncSubmodule(name, error);
+    });
+}
+
+void GitManager::setSubmoduleBranch(const QString& name, const QString& branch)
+{
+    runBoolean(QStringLiteral("set-submodule-branch"),
+               [name, branch](auto& backend, auto* error) {
+        return backend.setSubmoduleBranch(name, branch, error);
+    });
+}
+
+void GitManager::removeSubmodule(const QString& name, bool force)
+{
+    runBoolean(QStringLiteral("remove-submodule"),
+               [name, force](auto& backend, auto* error) {
+        return backend.removeSubmodule(name, force, error);
+    });
+}
+
+void GitManager::requestLfsState()
+{
+    enqueue(QStringLiteral("lfs-status"), [](LibGit2Backend& backend) {
+        TaskResult result;
+        LfsService service(backend.rootPath());
+        const LfsState state = service.state(true, &result.error);
+        result.applyOnError = true;
+        result.apply = [state, error = result.error](GitManager& manager) {
+            emit manager.sigLfsStateReady(state, error);
+        };
+        return result;
+    }, true, false, false, false);
+}
+
+void GitManager::trackLfsPattern(const QString& pattern)
+{
+    runBoolean(QStringLiteral("lfs-track"), [pattern](auto& backend, auto* error) {
+        return LfsService(backend.rootPath()).track(pattern, error);
+    });
+}
+
+void GitManager::untrackLfsPattern(const QString& pattern)
+{
+    runBoolean(QStringLiteral("lfs-untrack"), [pattern](auto& backend, auto* error) {
+        return LfsService(backend.rootPath()).untrack(pattern, error);
+    });
+}
+
+void GitManager::lockLfsPath(const QString& path)
+{
+    runBoolean(QStringLiteral("lfs-lock"), [path](auto& backend, auto* error) {
+        return LfsService(backend.rootPath()).lock(path, error);
+    }, false);
+}
+
+void GitManager::unlockLfsPath(const QString& path, bool force)
+{
+    runBoolean(QStringLiteral("lfs-unlock"), [path, force](auto& backend, auto* error) {
+        return LfsService(backend.rootPath()).unlock(path, force, error);
+    }, false);
+}
+
+void GitManager::requestHostingRemotes()
+{
+    enqueue(QStringLiteral("hosting-remotes"), [](LibGit2Backend& backend) {
+        TaskResult result;
+        const RepositoryState state = backend.snapshot(&result.error);
+        const QVector<RemoteInfo> remotes = backend.remotes(&result.error);
+        QVector<HostingRemoteInfo> hosted;
+        if (result.error.isEmpty()) {
+            for (const RemoteInfo& remote : remotes) {
+                const HostingRemoteInfo value = HostingService::describe(
+                    remote, state.headHash, state.headName);
+                if (value.provider != HostingProvider::Unknown)
+                    hosted.append(value);
+            }
+        }
+        result.applyOnError = true;
+        result.apply = [hosted, error = result.error](GitManager& manager) {
+            emit manager.sigHostingRemotesReady(hosted, error);
+        };
+        return result;
+    }, true, false, false, false);
+}
+
+void GitManager::setHostingToken(HostingProvider provider, const QString& token)
+{
+    const int key = static_cast<int>(provider);
+    if (token.isEmpty())
+        _hostingTokens.remove(key);
+    else
+        _hostingTokens.insert(key, token);
+}
+
+void GitManager::clearHostingTokens()
+{
+    _hostingTokens.clear();
+}
+
+void GitManager::requestHostingChanges(const HostingRemoteInfo& remote)
+{
+    const QString token = _hostingTokens.value(static_cast<int>(remote.provider));
+    enqueue(QStringLiteral("hosting-changes"),
+            [remote, token](LibGit2Backend&) {
+        TaskResult result;
+        const QVector<HostingChangeInfo> changes = HostingApiService().changes(
+            remote, token, &result.error);
+        result.applyOnError = true;
+        result.apply = [remote, changes, error = result.error](GitManager& manager) {
+            emit manager.sigHostingChangesReady(remote, changes, error);
+        };
+        return result;
+    }, true, false, false, false);
+}
+
+void GitManager::requestHostingIssues(const HostingRemoteInfo& remote)
+{
+    const QString token = _hostingTokens.value(static_cast<int>(remote.provider));
+    enqueue(QStringLiteral("hosting-issues"),
+            [remote, token](LibGit2Backend&) {
+        TaskResult result;
+        const QVector<HostingIssueInfo> issues = HostingApiService().issues(
+            remote, token, &result.error);
+        result.applyOnError = true;
+        result.apply = [remote, issues, error = result.error](GitManager& manager) {
+            emit manager.sigHostingIssuesReady(remote, issues, error);
+        };
+        return result;
+    }, true, false, false, false);
+}
+
+void GitManager::requestHostingReviewFiles(
+    const HostingRemoteInfo& remote, const HostingChangeInfo& change)
+{
+    const QString token = _hostingTokens.value(static_cast<int>(remote.provider));
+    enqueue(QStringLiteral("hosting-review-files"),
+            [remote, change, token](LibGit2Backend&) {
+        TaskResult result;
+        const QVector<HostingReviewFile> files = HostingApiService().reviewFiles(
+            remote, change, token, &result.error);
+        result.applyOnError = true;
+        result.apply = [remote, change, files, error = result.error](GitManager& manager) {
+            emit manager.sigHostingReviewFilesReady(remote, change, files, error);
+        };
+        return result;
+    }, true, false, false, false);
+}
+
+void GitManager::postHostingReviewComment(
+    const HostingRemoteInfo& remote, const HostingChangeInfo& change,
+    const HostingReviewFile& file, int line, const QString& body)
+{
+    const QString token = _hostingTokens.value(static_cast<int>(remote.provider));
+    enqueue(QStringLiteral("hosting-review-comment"),
+            [remote, change, file, line, body, token](LibGit2Backend&) {
+        TaskResult result;
+        const bool success = HostingApiService().postReviewComment(
+            remote, change, file, line, body, token, &result.error);
+        result.applyOnError = true;
+        result.apply = [success, error = result.error](GitManager& manager) {
+            emit manager.sigHostingReviewCommentFinished(
+                success, success ? QStringLiteral("Review comment submitted.") : error);
+        };
+        return result;
+    }, true, false, false, false);
+}
+
+void GitManager::requestGitDiagnostics()
+{
+    enqueue(QStringLiteral("git-diagnostics"), [](LibGit2Backend& backend) {
+        TaskResult result;
+        const QVector<RemoteInfo> remotes = backend.remotes(&result.error);
+        GitDiagnosticReport report;
+        if (result.error.isEmpty())
+            report = GitDiagnosticService(backend.rootPath()).inspect(remotes);
+        result.applyOnError = true;
+        result.apply = [report, error = result.error](GitManager& manager) {
+            emit manager.sigGitDiagnosticsReady(report, error);
+        };
+        return result;
+    }, true, false, false, false);
+}
+
+void GitManager::testRemoteConnection(const QString& remoteUrl)
+{
+    enqueue(QStringLiteral("test-remote-connection"),
+            [remoteUrl](LibGit2Backend& backend) {
+        TaskResult result;
+        const QString message = GitDiagnosticService(backend.rootPath())
+                                    .testRemote(remoteUrl, &result.error);
+        result.applyOnError = true;
+        result.apply = [message, error = result.error](GitManager& manager) {
+            emit manager.sigRemoteConnectionTestFinished(
+                error.isEmpty(), error.isEmpty() ? message : error);
+        };
+        return result;
+    }, true, false, false, false);
+}
+
+void GitManager::requestHooks()
+{
+    enqueue(QStringLiteral("list-hooks"), [](LibGit2Backend& backend) {
+        TaskResult result;
+        const QVector<HookInfo> hooks = HookService(backend.rootPath())
+                                            .hooks(&result.error);
+        result.applyOnError = true;
+        result.apply = [hooks, error = result.error](GitManager& manager) {
+            emit manager.sigHooksReady(hooks, error);
+        };
+        return result;
+    }, true, false, false, false);
 }
 
 void GitManager::fetch(bool prune)
@@ -703,6 +1088,13 @@ void GitManager::push()
 {
     runBoolean(QStringLiteral("push"), [](auto& backend, auto* error) {
         return backend.push({}, {}, false, error);
+    });
+}
+
+void GitManager::pushWithLease()
+{
+    runBoolean(QStringLiteral("push-with-lease"), [](auto& backend, auto* error) {
+        return backend.push({}, {}, false, error, true);
     });
 }
 

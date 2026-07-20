@@ -584,6 +584,60 @@ private slots:
         QVERIFY(found);
     }
 
+    void renamesBranchAndRemovesUpstream()
+    {
+        QTemporaryDir localDir;
+        QTemporaryDir remoteDir;
+        QVERIFY(localDir.isValid());
+        QVERIFY(remoteDir.isValid());
+
+        git_repository* bare = nullptr;
+        QCOMPARE(git_repository_init(&bare,
+                                     remoteDir.path().toUtf8().constData(), 1), 0);
+        git_repository_free(bare);
+
+        Git::LibGit2Backend backend;
+        QString error;
+        QVERIFY2(backend.initialize(localDir.path(), &error), qPrintable(error));
+        git_repository* local = nullptr;
+        QCOMPARE(git_repository_open(&local,
+                                     localDir.path().toUtf8().constData()), 0);
+        configure(local);
+        git_repository_free(local);
+
+        QFile file(localDir.filePath(QStringLiteral("branch.txt")));
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write("base\n");
+        file.close();
+        QVERIFY(backend.stage(QStringLiteral("branch.txt"), &error));
+        QVERIFY(backend.commit(QStringLiteral("base"), false, false, &error));
+
+        const QString original = backend.snapshot(&error).headName;
+        QVERIFY(!original.isEmpty());
+        QVERIFY(backend.addRemote(QStringLiteral("origin"), remoteDir.path(), &error));
+        QVERIFY2(backend.push(QStringLiteral("origin"), original, true, &error),
+                 qPrintable(error));
+
+        const QString renamed = QStringLiteral("feature/renamed");
+        QVERIFY2(backend.renameBranch(original, renamed, &error), qPrintable(error));
+        auto state = backend.snapshot(&error);
+        QCOMPARE(state.headName, renamed);
+        QCOMPARE(state.upstream, QStringLiteral("origin/") + original);
+        QVERIFY2(backend.unsetBranchUpstream(renamed, &error), qPrintable(error));
+        state = backend.snapshot(&error);
+        QCOMPARE(state.headName, renamed);
+        QVERIFY(state.upstream.isEmpty());
+
+        QCOMPARE(git_repository_open(&bare,
+                                     remoteDir.path().toUtf8().constData()), 0);
+        git_oid remoteTarget;
+        const QByteArray remoteRef = QStringLiteral("refs/heads/%1")
+            .arg(original).toUtf8();
+        QCOMPARE(git_reference_name_to_id(&remoteTarget, bare,
+                                          remoteRef.constData()), 0);
+        git_repository_free(bare);
+    }
+
     void diffAndPatchRoundTrip()
     {
         QTemporaryDir dir; Git::LibGit2Backend backend; QString error;
@@ -598,6 +652,56 @@ private slots:
         auto state=backend.snapshot(&error); QVERIFY(state.files[0].isStaged());
         QVERIFY2(backend.applyPatch(patch,true,true,&error),qPrintable(error));
         state=backend.snapshot(&error); QVERIFY(!state.files[0].isStaged()); QVERIFY(state.files[0].isUnstaged());
+    }
+
+    void revisionDiffResolvesBranchesAndCommits()
+    {
+        QTemporaryDir dir; QVERIFY(dir.isValid());
+        Git::LibGit2Backend backend; QString error;
+        QVERIFY2(backend.initialize(dir.path(), &error), qPrintable(error));
+        git_repository* repo = nullptr;
+        git_repository_open(&repo, dir.path().toUtf8().constData());
+        configure(repo);
+        git_repository_free(repo);
+
+        QFile file(dir.filePath(QStringLiteral("compare.txt")));
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write("base\n");
+        file.close();
+        QVERIFY2(backend.stage(QStringLiteral("compare.txt"), &error), qPrintable(error));
+        QVERIFY2(backend.commit(QStringLiteral("base"), false, false, &error), qPrintable(error));
+        const QString mainBranch = backend.snapshot(&error).headName;
+        QVERIFY2(!mainBranch.isEmpty(), qPrintable(error));
+        QVERIFY2(backend.createBranch(QStringLiteral("feature"), mainBranch, &error), qPrintable(error));
+
+        QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        file.write("main\n");
+        file.close();
+        QVERIFY2(backend.stage(QStringLiteral("compare.txt"), &error), qPrintable(error));
+        QVERIFY2(backend.commit(QStringLiteral("main change"), false, false, &error), qPrintable(error));
+        const QString mainTip = backend.snapshot(&error).headHash;
+
+        QVERIFY2(backend.checkoutBranch(QStringLiteral("feature"), &error), qPrintable(error));
+        QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        file.write("feature\n");
+        file.close();
+        QVERIFY2(backend.stage(QStringLiteral("compare.txt"), &error), qPrintable(error));
+        QVERIFY2(backend.commit(QStringLiteral("feature change"), false, false, &error), qPrintable(error));
+        const QString featureTip = backend.snapshot(&error).headHash;
+
+        const QString branchDiff = backend.revisionDiff(mainBranch, QStringLiteral("feature"), &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY(branchDiff.contains(QStringLiteral("compare %1..feature").arg(mainBranch)));
+        QVERIFY(branchDiff.contains(QStringLiteral("diff --git")));
+        QVERIFY(branchDiff.contains(QStringLiteral("main"))
+                || branchDiff.contains(QStringLiteral("feature")));
+
+        const QString hashDiff = backend.revisionDiff(mainTip, featureTip, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY(hashDiff.contains(QStringLiteral("compare %1..%2").arg(mainTip, featureTip)));
+        QVERIFY(hashDiff.contains(QStringLiteral("diff --git")));
+        QVERIFY(hashDiff.contains(QStringLiteral("main"))
+                || hashDiff.contains(QStringLiteral("feature")));
     }
 
     void stashAndDiscard()
@@ -747,6 +851,420 @@ private slots:
         QCOMPARE(git_oid_cmp(&remoteTarget, git_reference_target(head)), 0);
         git_reference_free(head);
         git_repository_free(local);
+    }
+
+    void forcePushWithLeaseRejectsStaleRemoteState()
+    {
+        QTemporaryDir publisherDir;
+        QTemporaryDir contenderParent;
+        QTemporaryDir remoteDir;
+        QVERIFY(publisherDir.isValid());
+        QVERIFY(contenderParent.isValid());
+        QVERIFY(remoteDir.isValid());
+
+        git_repository* repository = nullptr;
+        QCOMPARE(git_repository_init(&repository,
+                                     remoteDir.path().toUtf8().constData(), 1), 0);
+        git_repository_free(repository);
+
+        Git::LibGit2Backend publisher;
+        QString error;
+        QVERIFY2(publisher.initialize(publisherDir.path(), &error), qPrintable(error));
+        QCOMPARE(git_repository_open(&repository,
+                                     publisherDir.path().toUtf8().constData()), 0);
+        configure(repository);
+        git_repository_free(repository);
+
+        QFile published(publisherDir.filePath(QStringLiteral("lease.txt")));
+        QVERIFY(published.open(QIODevice::WriteOnly));
+        published.write("base\n");
+        published.close();
+        QVERIFY(publisher.stage(QStringLiteral("lease.txt"), &error));
+        QVERIFY(publisher.commit(QStringLiteral("base"), false, false, &error));
+        const QString branch = publisher.snapshot(&error).headName;
+        QVERIFY(publisher.addRemote(QStringLiteral("origin"), remoteDir.path(), &error));
+        QVERIFY2(publisher.push(QStringLiteral("origin"), branch, true, &error),
+                 qPrintable(error));
+
+        const QString contenderPath = contenderParent.filePath(QStringLiteral("clone"));
+        Git::LibGit2Backend contender;
+        QVERIFY2(contender.clone(remoteDir.path(), contenderPath, &error), qPrintable(error));
+        QCOMPARE(git_repository_open(&repository, contenderPath.toUtf8().constData()), 0);
+        configure(repository);
+        git_repository_free(repository);
+
+        QVERIFY(published.open(QIODevice::WriteOnly | QIODevice::Append));
+        published.write("publisher\n");
+        published.close();
+        QVERIFY(publisher.stage(QStringLiteral("lease.txt"), &error));
+        QVERIFY(publisher.commit(QStringLiteral("publisher update"), false, false, &error));
+        QVERIFY2(publisher.push({}, {}, false, &error), qPrintable(error));
+        const QString publishedTip = publisher.snapshot(&error).headHash;
+
+        QFile contenderFile(QDir(contenderPath).filePath(QStringLiteral("lease.txt")));
+        QVERIFY(contenderFile.open(QIODevice::WriteOnly | QIODevice::Append));
+        contenderFile.write("contender\n");
+        contenderFile.close();
+        QVERIFY(contender.stage(QStringLiteral("lease.txt"), &error));
+        QVERIFY(contender.commit(QStringLiteral("contender update"), false, false, &error));
+        const QString contenderTip = contender.snapshot(&error).headHash;
+
+        error.clear();
+        QVERIFY(!contender.push({}, {}, false, &error, true));
+        QVERIFY2(error.contains(QStringLiteral("remote branch changed")),
+                 qPrintable(error));
+        QCOMPARE(git_repository_open(&repository,
+                                     remoteDir.path().toUtf8().constData()), 0);
+        git_oid remoteOid;
+        const QByteArray remoteRef = QStringLiteral("refs/heads/%1").arg(branch).toUtf8();
+        QCOMPARE(git_reference_name_to_id(&remoteOid, repository,
+                                          remoteRef.constData()), 0);
+        QCOMPARE(oidText(&remoteOid), publishedTip);
+        git_repository_free(repository);
+
+        error.clear();
+        QVERIFY2(contender.fetchAll(false, &error), qPrintable(error));
+        QVERIFY2(contender.push({}, {}, false, &error, true), qPrintable(error));
+        QCOMPARE(git_repository_open(&repository,
+                                     remoteDir.path().toUtf8().constData()), 0);
+        QCOMPARE(git_reference_name_to_id(&remoteOid, repository,
+                                          remoteRef.constData()), 0);
+        QCOMPARE(oidText(&remoteOid), contenderTip);
+        git_repository_free(repository);
+    }
+
+    void pushesDeletesRemoteTagsAndPrunesRemoteTrackingRefs()
+    {
+        QTemporaryDir localDir;
+        QTemporaryDir remoteDir;
+        QVERIFY(localDir.isValid());
+        QVERIFY(remoteDir.isValid());
+
+        git_repository* bare = nullptr;
+        QCOMPARE(git_repository_init(&bare,
+                                     remoteDir.path().toUtf8().constData(), 1), 0);
+        git_repository_free(bare);
+
+        Git::LibGit2Backend backend; QString error;
+        QVERIFY2(backend.initialize(localDir.path(), &error), qPrintable(error));
+        git_repository* local = nullptr;
+        QCOMPARE(git_repository_open(&local,
+                                     localDir.path().toUtf8().constData()), 0);
+        configure(local);
+        git_repository_free(local);
+
+        QFile file(localDir.filePath(QStringLiteral("remote.txt")));
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write("base\n");
+        file.close();
+        QVERIFY2(backend.stage(QStringLiteral("remote.txt"), &error), qPrintable(error));
+        QVERIFY2(backend.commit(QStringLiteral("base"), false, false, &error), qPrintable(error));
+
+        const QString mainBranch = backend.snapshot(&error).headName;
+        QVERIFY2(!mainBranch.isEmpty(), qPrintable(error));
+        QVERIFY2(backend.addRemote(QStringLiteral("origin"), remoteDir.path(), &error),
+                 qPrintable(error));
+        QVERIFY2(backend.push(QStringLiteral("origin"), mainBranch, true, &error),
+                 qPrintable(error));
+
+        QVERIFY2(backend.createTag(QStringLiteral("v1.0.0"), {}, {}, &error),
+                 qPrintable(error));
+        QVERIFY2(backend.pushTag(QStringLiteral("origin"), QStringLiteral("v1.0.0"), &error),
+                 qPrintable(error));
+
+        QCOMPARE(git_repository_open(&bare,
+                                     remoteDir.path().toUtf8().constData()), 0);
+        git_oid remoteTagOid;
+        QCOMPARE(git_reference_name_to_id(&remoteTagOid, bare,
+                                          "refs/tags/v1.0.0"), 0);
+        git_repository_free(bare);
+
+        QVERIFY2(backend.deleteRemoteTag(QStringLiteral("origin"),
+                                         QStringLiteral("v1.0.0"), &error),
+                 qPrintable(error));
+        QCOMPARE(git_repository_open(&bare,
+                                     remoteDir.path().toUtf8().constData()), 0);
+        QCOMPARE(git_reference_name_to_id(&remoteTagOid, bare,
+                                          "refs/tags/v1.0.0"), GIT_ENOTFOUND);
+        git_repository_free(bare);
+
+        QVERIFY2(backend.createBranch(QStringLiteral("stale"), mainBranch, &error),
+                 qPrintable(error));
+        QVERIFY2(backend.push(QStringLiteral("origin"), QStringLiteral("stale"), true, &error),
+                 qPrintable(error));
+
+        QCOMPARE(git_repository_open(&bare,
+                                     remoteDir.path().toUtf8().constData()), 0);
+        git_reference* staleRef = nullptr;
+        QCOMPARE(git_reference_lookup(&staleRef, bare, "refs/heads/stale"), 0);
+        QCOMPARE(git_reference_delete(staleRef), 0);
+        git_reference_free(staleRef);
+        git_repository_free(bare);
+
+        QVERIFY2(backend.pruneRemote(QStringLiteral("origin"), &error), qPrintable(error));
+
+        QCOMPARE(git_repository_open(&local,
+                                     localDir.path().toUtf8().constData()), 0);
+        git_reference* remoteTracking = nullptr;
+        QCOMPARE(git_reference_lookup(&remoteTracking, local,
+                                      "refs/remotes/origin/stale"), GIT_ENOTFOUND);
+        git_reference_free(remoteTracking);
+        git_repository_free(local);
+    }
+
+    void createsListsAndRemovesWorktree()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+
+        Git::LibGit2Backend backend;
+        QString error;
+        QVERIFY2(backend.initialize(dir.path(), &error), qPrintable(error));
+
+        git_repository* repo = nullptr;
+        QCOMPARE(git_repository_open(&repo, dir.path().toUtf8().constData()), 0);
+        configure(repo);
+        git_repository_free(repo);
+
+        QFile file(dir.filePath(QStringLiteral("worktree.txt")));
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write("base\n");
+        file.close();
+        QVERIFY2(backend.stage(QStringLiteral("worktree.txt"), &error), qPrintable(error));
+        QVERIFY2(backend.commit(QStringLiteral("base"), false, false, &error), qPrintable(error));
+        QCOMPARE(git_repository_open(&repo, dir.path().toUtf8().constData()), 0);
+        git_oid targetOid;
+        const QByteArray headHash = backend.snapshot(&error).headHash.toUtf8();
+        QCOMPARE(git_oid_fromstr(&targetOid, headHash.constData()), 0);
+        QVERIFY2(updateBranch(repo, "refs/heads/feature-tree", targetOid, false, &error),
+                 qPrintable(error));
+        git_repository_free(repo);
+
+        const QString worktreePath = QDir(dir.path()).filePath(QStringLiteral("linked-tree"));
+        QVERIFY2(backend.addWorktree(QStringLiteral("feature-tree"), worktreePath,
+                                     QStringLiteral("feature-tree"), &error),
+                 qPrintable(error));
+
+        const QVector<Git::WorktreeInfo> worktrees = backend.worktrees(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY(worktrees.size() >= 2);
+        bool foundLinked = false;
+        for (const Git::WorktreeInfo& worktree : worktrees) {
+            if (worktree.name != QStringLiteral("feature-tree"))
+                continue;
+            foundLinked = true;
+            QCOMPARE(QDir::cleanPath(worktree.path), QDir::cleanPath(worktreePath));
+            QCOMPARE(worktree.headBranch, QStringLiteral("feature-tree"));
+            QVERIFY(worktree.valid);
+        }
+        QVERIFY(foundLinked);
+
+        QVERIFY2(backend.removeWorktree(QStringLiteral("feature-tree"), true, &error),
+                 qPrintable(error));
+        QVERIFY(!QDir(worktreePath).exists());
+        const QVector<Git::WorktreeInfo> after = backend.worktrees(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        for (const Git::WorktreeInfo& worktree : after)
+            QVERIFY(worktree.name != QStringLiteral("feature-tree"));
+    }
+
+    void locksAndUnlocksWorktree()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+
+        Git::LibGit2Backend backend;
+        QString error;
+        QVERIFY2(backend.initialize(dir.path(), &error), qPrintable(error));
+
+        git_repository* repo = nullptr;
+        QCOMPARE(git_repository_open(&repo, dir.path().toUtf8().constData()), 0);
+        configure(repo);
+        git_repository_free(repo);
+
+        QFile file(dir.filePath(QStringLiteral("lock-tree.txt")));
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write("base\n");
+        file.close();
+        QVERIFY2(backend.stage(QStringLiteral("lock-tree.txt"), &error), qPrintable(error));
+        QVERIFY2(backend.commit(QStringLiteral("base"), false, false, &error), qPrintable(error));
+        QCOMPARE(git_repository_open(&repo, dir.path().toUtf8().constData()), 0);
+        git_oid targetOid;
+        const QByteArray headHash = backend.snapshot(&error).headHash.toUtf8();
+        QCOMPARE(git_oid_fromstr(&targetOid, headHash.constData()), 0);
+        QVERIFY2(updateBranch(repo, "refs/heads/lock-tree", targetOid, false, &error),
+                 qPrintable(error));
+        git_repository_free(repo);
+
+        const QString worktreePath = QDir(dir.path()).filePath(QStringLiteral("locked-tree"));
+        QVERIFY2(backend.addWorktree(QStringLiteral("lock-tree"), worktreePath,
+                                     QStringLiteral("lock-tree"), &error),
+                 qPrintable(error));
+
+        QVERIFY2(backend.lockWorktree(QStringLiteral("lock-tree"),
+                                      QStringLiteral("portable drive"), &error),
+                 qPrintable(error));
+        QVector<Git::WorktreeInfo> worktrees = backend.worktrees(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        bool foundLocked = false;
+        for (const Git::WorktreeInfo& worktree : worktrees) {
+            if (worktree.name != QStringLiteral("lock-tree"))
+                continue;
+            foundLocked = true;
+            QVERIFY(worktree.locked);
+            QCOMPARE(worktree.lockReason, QStringLiteral("portable drive"));
+        }
+        QVERIFY(foundLocked);
+
+        QVERIFY2(backend.unlockWorktree(QStringLiteral("lock-tree"), &error),
+                 qPrintable(error));
+        worktrees = backend.worktrees(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        for (const Git::WorktreeInfo& worktree : worktrees) {
+            if (worktree.name != QStringLiteral("lock-tree"))
+                continue;
+            QVERIFY(!worktree.locked);
+            QVERIFY(worktree.lockReason.isEmpty());
+        }
+
+        QVERIFY2(backend.removeWorktree(QStringLiteral("lock-tree"), true, &error),
+                 qPrintable(error));
+    }
+
+    void movesWorktree()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+
+        Git::LibGit2Backend backend;
+        QString error;
+        QVERIFY2(backend.initialize(dir.path(), &error), qPrintable(error));
+
+        git_repository* repo = nullptr;
+        QCOMPARE(git_repository_open(&repo, dir.path().toUtf8().constData()), 0);
+        configure(repo);
+        git_repository_free(repo);
+
+        QFile file(dir.filePath(QStringLiteral("move-tree.txt")));
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write("base\n");
+        file.close();
+        QVERIFY2(backend.stage(QStringLiteral("move-tree.txt"), &error), qPrintable(error));
+        QVERIFY2(backend.commit(QStringLiteral("base"), false, false, &error), qPrintable(error));
+        QCOMPARE(git_repository_open(&repo, dir.path().toUtf8().constData()), 0);
+        git_oid targetOid;
+        const QByteArray headHash = backend.snapshot(&error).headHash.toUtf8();
+        QCOMPARE(git_oid_fromstr(&targetOid, headHash.constData()), 0);
+        QVERIFY2(updateBranch(repo, "refs/heads/move-tree", targetOid, false, &error),
+                 qPrintable(error));
+        git_repository_free(repo);
+
+        const QString originalPath = QDir(dir.path()).filePath(QStringLiteral("move-tree-original"));
+        const QString movedPath = QDir(dir.path()).filePath(QStringLiteral("move-tree-moved"));
+        QVERIFY2(backend.addWorktree(QStringLiteral("move-tree"), originalPath,
+                                     QStringLiteral("move-tree"), &error),
+                 qPrintable(error));
+
+        QVERIFY2(backend.moveWorktree(QStringLiteral("move-tree"), movedPath, &error),
+                 qPrintable(error));
+        QVERIFY(!QDir(originalPath).exists());
+        QVERIFY(QDir(movedPath).exists());
+
+        const QVector<Git::WorktreeInfo> worktrees = backend.worktrees(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        bool foundMoved = false;
+        for (const Git::WorktreeInfo& worktree : worktrees) {
+            if (worktree.name != QStringLiteral("move-tree"))
+                continue;
+            foundMoved = true;
+            QCOMPARE(QDir::cleanPath(worktree.path), QDir::cleanPath(movedPath));
+            QCOMPARE(worktree.headBranch, QStringLiteral("move-tree"));
+            QVERIFY(worktree.valid);
+        }
+        QVERIFY(foundMoved);
+
+        Git::LibGit2Backend movedBackend;
+        QVERIFY2(movedBackend.open(movedPath, &error), qPrintable(error));
+        const auto movedState = movedBackend.snapshot(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(movedState.headName, QStringLiteral("move-tree"));
+
+        QVERIFY2(backend.removeWorktree(QStringLiteral("move-tree"), true, &error),
+                 qPrintable(error));
+    }
+
+    void addsListsUpdatesAndSyncsSubmodule()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString sourcePath = dir.filePath(QStringLiteral("source"));
+        const QString parentPath = dir.filePath(QStringLiteral("parent"));
+
+        Git::LibGit2Backend source;
+        Git::LibGit2Backend parent;
+        QString error;
+        QVERIFY2(source.initialize(sourcePath, &error), qPrintable(error));
+        git_repository* repo = nullptr;
+        QCOMPARE(git_repository_open(&repo, sourcePath.toUtf8().constData()), 0);
+        configure(repo);
+        git_repository_free(repo);
+        QFile sourceFile(QDir(sourcePath).filePath(QStringLiteral("library.txt")));
+        QVERIFY(sourceFile.open(QIODevice::WriteOnly));
+        sourceFile.write("library\n");
+        sourceFile.close();
+        QVERIFY2(source.stage(QStringLiteral("library.txt"), &error), qPrintable(error));
+        QVERIFY2(source.commit(QStringLiteral("library base"), false, false, &error),
+                 qPrintable(error));
+
+        QVERIFY2(parent.initialize(parentPath, &error), qPrintable(error));
+        QCOMPARE(git_repository_open(&repo, parentPath.toUtf8().constData()), 0);
+        configure(repo);
+        git_repository_free(repo);
+        QFile parentFile(QDir(parentPath).filePath(QStringLiteral("README.md")));
+        QVERIFY(parentFile.open(QIODevice::WriteOnly));
+        parentFile.write("parent\n");
+        parentFile.close();
+        QVERIFY2(parent.stage(QStringLiteral("README.md"), &error), qPrintable(error));
+        QVERIFY2(parent.commit(QStringLiteral("parent base"), false, false, &error),
+                 qPrintable(error));
+
+        QVERIFY2(parent.addSubmodule(sourcePath, QStringLiteral("deps/library"), &error),
+                 qPrintable(error));
+        QVector<Git::SubmoduleInfo> submodules = parent.submodules(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(submodules.size(), 1);
+        QCOMPARE(submodules.first().name, QStringLiteral("deps/library"));
+        QCOMPARE(submodules.first().path, QStringLiteral("deps/library"));
+        QCOMPARE(QDir::cleanPath(submodules.first().url), QDir::cleanPath(sourcePath));
+        QVERIFY(submodules.first().initialized);
+        QVERIFY(!submodules.first().workdirHash.isEmpty());
+
+        QVERIFY2(parent.syncSubmodule(QStringLiteral("deps/library"), &error),
+                 qPrintable(error));
+        QVERIFY2(parent.updateSubmodule(QStringLiteral("deps/library"), &error),
+                 qPrintable(error));
+        QVERIFY2(parent.commit(QStringLiteral("add submodule"), false, false, &error),
+                 qPrintable(error));
+        QVERIFY2(parent.setSubmoduleBranch(QStringLiteral("deps/library"),
+                                           QStringLiteral("main"), &error),
+                 qPrintable(error));
+        submodules = parent.submodules(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(submodules.first().branch, QStringLiteral("main"));
+        QVERIFY2(parent.commit(QStringLiteral("track submodule branch"),
+                               false, false, &error), qPrintable(error));
+        const Git::RepositoryState state = parent.snapshot(&error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(state.submodules.size(), 1);
+        QVERIFY(QFileInfo::exists(QDir(parentPath).filePath(
+            QStringLiteral("deps/library/library.txt"))));
+
+        QVERIFY2(parent.removeSubmodule(QStringLiteral("deps/library"), false, &error),
+                 qPrintable(error));
+        QVERIFY(!QFileInfo::exists(QDir(parentPath).filePath(
+            QStringLiteral("deps/library"))));
+        QVERIFY(parent.submodules(&error).isEmpty());
+        QVERIFY2(error.isEmpty(), qPrintable(error));
     }
 
     void commitHistoryPaginatesBeyondOneThousandCommits()

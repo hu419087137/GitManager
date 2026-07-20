@@ -45,6 +45,7 @@ void BranchListWidget::setBranches(const QVector<Git::Branch>& branches)
         item->setData(0, Qt::UserRole,     b.name);
         item->setData(0, Qt::UserRole + 1, b.isRemote);
         item->setData(0, Qt::UserRole + 2, b.isCurrent);
+        item->setData(0, Qt::UserRole + 3, b.upstream);
 
         if (b.isCurrent) {
             // 当前本地分支：加粗 + "* " 前缀
@@ -92,6 +93,7 @@ void BranchListWidget::slotContextMenu(const QPoint& pos)
     const QString name     = item->data(0, Qt::UserRole).toString();
     const bool    isRemote = item->data(0, Qt::UserRole + 1).toBool();
     const bool    isCurrent = item->data(0, Qt::UserRole + 2).toBool();
+    const QString upstream = item->data(0, Qt::UserRole + 3).toString();
 
     QMenu menu(this);
 
@@ -118,6 +120,27 @@ void BranchListWidget::slotContextMenu(const QPoint& pos)
         rebase->setObjectName(QStringLiteral("branchRebaseAction"));
         merge->setEnabled(_operationsEnabled && !isCurrent);
         rebase->setEnabled(_operationsEnabled && !isCurrent);
+
+        menu.addSeparator();
+        QAction* rename = menu.addAction(QStringLiteral("Rename Branch..."), [this, name] {
+            emit sigRenameRequested(name);
+        });
+        rename->setObjectName(QStringLiteral("branchRenameAction"));
+        rename->setEnabled(_operationsEnabled);
+
+        if (upstream.isEmpty()) {
+            QAction* publish = menu.addAction(QStringLiteral("Publish Branch..."), [this, name] {
+                emit sigPublishRequested(name);
+            });
+            publish->setObjectName(QStringLiteral("branchPublishAction"));
+            publish->setEnabled(_operationsEnabled);
+        } else {
+            QAction* untrack = menu.addAction(QStringLiteral("Untrack Branch"), [this, name] {
+                emit sigUntrackRequested(name);
+            });
+            untrack->setObjectName(QStringLiteral("branchUntrackAction"));
+            untrack->setEnabled(_operationsEnabled);
+        }
 
         menu.addSeparator();
         QAction* deleteBranch = menu.addAction(QStringLiteral("Delete Branch"), [this, name] {

@@ -80,6 +80,9 @@ signals:
 
     /** @brief 当前提交选择已清空。 */
     void sigCommitSelectionCleared();
+    void sigCompareBaseSelected(const QString& revision);
+    void sigCompareRequested(const QString& baseRevision,
+                             const QString& targetRevision);
 
     void sigCreateBranchRequested(const QString& commitHash);
     void sigMergeRequested(const QString& revision);
@@ -99,6 +102,7 @@ private:
     void updateGraphVisibility();
     void ensureGraphColumnWidth();
     void saveSettings() const;
+    QString compareBaseLabel() const;
 
     QLineEdit*          _searchEdit       {nullptr};
     QComboBox*          _branchCombo      {nullptr};
@@ -121,6 +125,7 @@ private:
     bool                 _historyLoading  {false};
     bool                 _queryPending    {false};
     bool                 _operationsEnabled {false};
+    QString              _compareBaseRevision;
 };
 
 // ============================================================

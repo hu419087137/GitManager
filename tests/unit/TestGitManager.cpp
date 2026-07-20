@@ -1,7 +1,9 @@
 #include "core/GitManager.h"
+#include "core/RepositoryWatcher.h"
 
 #include <git2.h>
 #include <QDir>
+#include <QFile>
 #include <QSet>
 #include <QSignalSpy>
 #include <QTemporaryDir>
@@ -145,6 +147,7 @@ private slots:
     {
         QVERIFY(git_libgit2_init() > 0);
         qRegisterMetaType<Git::CommitHistoryPage>();
+        qRegisterMetaType<Git::HookResult>();
     }
 
     void cleanupTestCase()
@@ -295,6 +298,83 @@ private slots:
         QCOMPARE(errorSpy.count(), 0);
     }
 
+    void latestRevisionDiffRequestWinsWithoutRefreshingState()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        QString error;
+        QVector<QString> hashes;
+        QVERIFY2(createRepository(directory.path(), 250, QStringLiteral("compare"),
+                                  &hashes, &error), qPrintable(error));
+
+        Git::GitManager manager;
+        QSignalSpy historySpy(&manager, &Git::GitManager::sigCommitHistoryReady);
+        manager.openRepository(directory.path());
+        QTRY_COMPARE_WITH_TIMEOUT(historySpy.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 15000);
+
+        QSignalSpy diffSpy(&manager, &Git::GitManager::sigDiffReady);
+        QSignalSpy stateSpy(&manager, &Git::GitManager::sigStateReady);
+        QSignalSpy errorSpy(&manager, &Git::GitManager::sigError);
+        bool replaced = false;
+        connect(&manager, &Git::GitManager::sigCommandStarted, &manager,
+                [&](const QString& command) {
+            if (replaced || command != QStringLiteral("libgit2: diff-compare"))
+                return;
+            replaced = true;
+            manager.fetchRevisionDiff(hashes.last(), hashes.at(hashes.size() - 2));
+        });
+
+        manager.fetchRevisionDiff(hashes.first(), hashes.at(1));
+        QVERIFY(replaced);
+        QTRY_COMPARE_WITH_TIMEOUT(diffSpy.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 15000);
+        QCOMPARE(diffSpy.first().at(1).toString(),
+                 QStringLiteral("%1..%2")
+                     .arg(hashes.last(), hashes.at(hashes.size() - 2)));
+        QCOMPARE(stateSpy.count(), 0);
+        QCOMPARE(errorSpy.count(), 0);
+    }
+
+    void repositoryWatcherDebouncesAndSwitchesPaths()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        QString error;
+        QVERIFY2(createRepository(directory.path(), 1, QStringLiteral("watch"),
+                                  nullptr, &error), qPrintable(error));
+
+        Git::RepositoryWatcher watcher;
+        QSignalSpy refreshSpy(&watcher, &Git::RepositoryWatcher::sigRefreshRequested);
+        QVERIFY(refreshSpy.isValid());
+
+        watcher.setRepositoryPath(directory.path());
+        const QString headPath = QDir(directory.path()).filePath(QStringLiteral(".git/HEAD"));
+        QFile headFile(headPath);
+        QVERIFY(headFile.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        headFile.write("ref: refs/heads/main\n");
+        headFile.close();
+        QTRY_COMPARE_WITH_TIMEOUT(refreshSpy.count(), 1, 5000);
+
+        const int refreshesBeforeActivation = refreshSpy.count();
+        watcher.notifyWindowActivated();
+        QTRY_COMPARE_WITH_TIMEOUT(refreshSpy.count(),
+                                  refreshesBeforeActivation + 1, 5000);
+
+        refreshSpy.clear();
+        QTemporaryDir secondDirectory;
+        QVERIFY(secondDirectory.isValid());
+        QVERIFY2(createRepository(secondDirectory.path(), 1, QStringLiteral("watch-two"),
+                                  nullptr, &error), qPrintable(error));
+        watcher.setRepositoryPath(secondDirectory.path());
+        const QString secondHeadPath = QDir(secondDirectory.path()).filePath(QStringLiteral(".git/HEAD"));
+        QFile secondHead(secondHeadPath);
+        QVERIFY(secondHead.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        secondHead.write("ref: refs/heads/main\n");
+        secondHead.close();
+        QTRY_COMPARE_WITH_TIMEOUT(refreshSpy.count(), 1, 5000);
+    }
+
     void refreshReloadsHistoryOnlyWhenReferencesChange()
     {
         QTemporaryDir directory;
@@ -338,6 +418,40 @@ private slots:
         for (const Git::Commit& commit : pageAt(historySpy, 0).commits)
             foundSide = foundSide || commit.refs.contains(QStringLiteral("side"));
         QVERIFY(foundSide);
+    }
+
+    void watcherRefreshReusesRecentCachedState()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        QString error;
+        QVector<QString> hashes;
+        QVERIFY2(createRepository(directory.path(), 3, QStringLiteral("cache"),
+                                  &hashes, &error), qPrintable(error));
+
+        Git::GitManager manager;
+        QSignalSpy historySpy(&manager, &Git::GitManager::sigCommitHistoryReady);
+        QSignalSpy stateSpy(&manager, &Git::GitManager::sigStateReady);
+        int refreshStarts = 0;
+        connect(&manager, &Git::GitManager::sigCommandStarted, &manager,
+                [&](const QString& command) {
+            if (command == QStringLiteral("libgit2: refresh"))
+                ++refreshStarts;
+        });
+
+        manager.openRepository(directory.path());
+        QTRY_COMPARE_WITH_TIMEOUT(historySpy.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 15000);
+        QVERIFY(refreshStarts >= 1);
+
+        stateSpy.clear();
+        const int refreshStartsBefore = refreshStarts;
+        manager.refreshFromWatcher();
+        QTRY_COMPARE_WITH_TIMEOUT(stateSpy.count(), 1, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 5000);
+        QCOMPARE(refreshStarts, refreshStartsBefore);
+        QCOMPARE(qvariant_cast<Git::RepositoryState>(stateSpy.first().at(0)).headHash,
+                 hashes.last());
     }
 
     void repositorySwitchSuppressesPreviousHistory()
@@ -666,6 +780,92 @@ private slots:
                  Git::HistoryOperationStatus::Completed);
         QCOMPARE(qvariant_cast<Git::RepositoryState>(stateSpy.last().at(0)).headHash,
                  hashes.first());
+        QCOMPARE(errorSpy.count(), 0);
+    }
+
+    void commitHonorsPreAndPostCommitHooks()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        QString error;
+        QVector<QString> hashes;
+        QVERIFY2(createRepository(directory.path(), 1, QStringLiteral("hooks"),
+                                  &hashes, &error), qPrintable(error));
+
+        QProcess config;
+        config.setWorkingDirectory(directory.path());
+        config.start(QStringLiteral("git"),
+                     {QStringLiteral("config"), QStringLiteral("user.name"),
+                      QStringLiteral("Hook Tester")});
+        QVERIFY(config.waitForFinished(10000));
+        QCOMPARE(config.exitCode(), 0);
+        config.start(QStringLiteral("git"),
+                     {QStringLiteral("config"), QStringLiteral("user.email"),
+                      QStringLiteral("hooks@example.com")});
+        QVERIFY(config.waitForFinished(10000));
+        QCOMPARE(config.exitCode(), 0);
+
+        QFile content(QDir(directory.path()).filePath(QStringLiteral("change.txt")));
+        QVERIFY(content.open(QIODevice::WriteOnly));
+        QCOMPARE(content.write("hook integration\n"), qint64(17));
+        content.close();
+
+        const QString hooksPath = QDir(directory.path()).filePath(
+            QStringLiteral(".git/hooks"));
+        const auto writeHook = [&hooksPath](const QString& name,
+                                             const QByteArray& script) {
+            QFile hook(QDir(hooksPath).filePath(name));
+            if (!hook.open(QIODevice::WriteOnly) || hook.write(script) != script.size())
+                return false;
+            hook.close();
+            return hook.setPermissions(hook.permissions() | QFileDevice::ExeOwner
+                                       | QFileDevice::ExeGroup | QFileDevice::ExeOther);
+        };
+        QVERIFY(writeHook(QStringLiteral("pre-commit"),
+                          "#!/bin/sh\necho pre-blocked\nexit 9\n"));
+
+        Git::GitManager manager;
+        QSignalSpy historySpy(&manager, &Git::GitManager::sigCommitHistoryReady);
+        QSignalSpy operationSpy(&manager, &Git::GitManager::sigOperationFinished);
+        QSignalSpy hookSpy(&manager, &Git::GitManager::sigHookFinished);
+        QSignalSpy errorSpy(&manager, &Git::GitManager::sigError);
+        manager.openRepository(directory.path());
+        QTRY_COMPARE_WITH_TIMEOUT(historySpy.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 15000);
+
+        manager.stageFile(QStringLiteral("change.txt"));
+        QTRY_COMPARE_WITH_TIMEOUT(operationSpy.count(), 1, 15000);
+        QVERIFY(operationSpy.takeFirst().at(1).toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 15000);
+
+        manager.commit(QStringLiteral("must be blocked"), false, false);
+        QTRY_COMPARE_WITH_TIMEOUT(operationSpy.count(), 1, 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(hookSpy.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 15000);
+        QVERIFY(!operationSpy.takeFirst().at(1).toBool());
+        const Git::HookResult blocked =
+            qvariant_cast<Git::HookResult>(hookSpy.takeFirst().at(0));
+        QCOMPARE(blocked.name, QStringLiteral("pre-commit"));
+        QCOMPARE(blocked.exitCode, 9);
+        QVERIFY(blocked.output.contains(QStringLiteral("pre-blocked")));
+
+        Git::LibGit2Backend backend;
+        QVERIFY2(backend.open(directory.path(), &error), qPrintable(error));
+        QCOMPARE(backend.snapshot(&error).headHash, hashes.first());
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+
+        QVERIFY(writeHook(QStringLiteral("pre-commit"),
+                          "#!/bin/sh\necho pre-ok\nexit 0\n"));
+        QVERIFY(writeHook(QStringLiteral("post-commit"),
+                          "#!/bin/sh\nprintf post-ok > post-hook-ran\nexit 0\n"));
+        errorSpy.clear();
+        manager.commit(QStringLiteral("hooks accepted"), false, false);
+        QTRY_COMPARE_WITH_TIMEOUT(operationSpy.count(), 1, 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(hookSpy.count(), 1, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(!manager.isBusy(), 15000);
+        QVERIFY(operationSpy.takeFirst().at(1).toBool());
+        QVERIFY(QFileInfo::exists(QDir(directory.path()).filePath(
+            QStringLiteral("post-hook-ran"))));
         QCOMPARE(errorSpy.count(), 0);
     }
 

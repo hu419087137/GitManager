@@ -11,10 +11,15 @@ class RepoListWidget;
 class StatusWidget;
 class DiffWidget;
 class TerminalWidget;
+class CompareWidget;
+class NotificationWidget;
+class WelcomeWidget;
+namespace Git { class RepositoryWatcher; }
 class QSplitter;
 class QLabel;
 class QTabWidget;
 class QAction;
+class QStackedWidget;
 
 /**
  * @brief 主窗口
@@ -32,6 +37,7 @@ class MainWindow : public QMainWindow {
 
 public:
     explicit MainWindow(QWidget* parent = nullptr);
+    ~MainWindow() override;
 
 private slots:
     // ---- 工具栏操作 ----
@@ -40,11 +46,20 @@ private slots:
     void slotCloneRepo();
     void slotFetch();
     void slotRemote();
+    void slotWorktree();
+    void slotSubmodule();
+    void slotLfs();
+    void slotHosting();
+    void slotGitDiagnostics();
+    void slotHooks();
+    void slotExternalTools();
+    void slotExternalDiff();
     void slotStash();
     void slotRepositoryOperation();
     void slotRefresh();
     void slotPull();
     void slotPush();
+    void slotPushWithLease();
     void slotCommit();
     void slotCancelOperation();
 
@@ -64,15 +79,23 @@ private slots:
     void slotCheckoutBranch(const QString& branchName);
     void slotDeleteBranch(const QString& branchName, bool force);
     void slotCreateBranch(const QString& fromBranch);
+    void slotRenameBranch(const QString& branchName);
+    void slotPublishBranch(const QString& branchName);
+    void slotUntrackBranch(const QString& branchName);
     void slotMergeRevision(const QString& revision);
     void slotRebaseRevision(const QString& revision);
     void slotCherryPickCommit(const QString& commitHash, int mainline);
     void slotRevertCommit(const QString& commitHash, int mainline);
     void slotResetCommit(const QString& commitHash);
+    void slotCompareRevisions(const QString& baseRevision,
+                              const QString& targetRevision);
 
     // ---- 标签操作 ----
     void slotCreateTag(const QString& commitHash);
     void slotDeleteTag(const QString& tagName);
+    void slotPushTag();
+    void slotDeleteRemoteTag();
+    void slotPruneRemote();
 
     // ---- 错误处理 ----
     void slotGitError(const QString& message);
@@ -87,6 +110,12 @@ private slots:
     void slotBusyChanged(bool busy);
 
 private:
+#ifdef Q_OS_WIN
+    bool nativeEvent(const QByteArray& eventType, void* message,
+                     qintptr* result) override;
+#endif
+    bool event(QEvent* event) override;
+
     enum class DiffSource { None, File, Commit };
 
     void setupToolBar();
@@ -104,14 +133,19 @@ private:
     void showStatus(const QString& msg);
 
     Git::GitManager*   _git              {nullptr};
+    Git::RepositoryWatcher* _watcher     {nullptr};
 
     RepoListWidget*    _repoList         {nullptr};
     CommitGraphWidget* _commitGraph      {nullptr};
     BranchListWidget*  _branchList       {nullptr};
     StatusWidget*      _statusWidget     {nullptr};
     DiffWidget*        _diffWidget       {nullptr};
+    CompareWidget*     _compareWidget    {nullptr};
     QTabWidget*        _rightTabs        {nullptr};
     TerminalWidget*    _terminalWidget   {nullptr};
+    NotificationWidget* _notification    {nullptr};
+    WelcomeWidget*     _welcomeWidget    {nullptr};
+    QStackedWidget*    _centralStack     {nullptr};
     QLabel*            _repoLabel        {nullptr};
     QAction*           _cancelAction     {nullptr};
     QAction*           _operationAction  {nullptr};
@@ -121,6 +155,7 @@ private:
     QStringList _stashes;
     DiffSource _requestedDiffSource {DiffSource::None};
     DiffSource _displayedDiffSource {DiffSource::None};
+    QString _currentDiffPath;
 };
 
 #endif // MAINWINDOW_H

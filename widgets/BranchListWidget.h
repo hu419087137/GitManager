@@ -30,6 +30,10 @@ signals:
     /** @brief 用户请求以此分支为基础新建分支 */
     void sigCreateFromRequested(const QString& fromBranch);
 
+    void sigRenameRequested(const QString& branchName);
+    void sigPublishRequested(const QString& branchName);
+    void sigUntrackRequested(const QString& branchName);
+
     /** @brief 用户请求将指定分支合并到当前分支。 */
     void sigMergeRequested(const QString& branchName);
 

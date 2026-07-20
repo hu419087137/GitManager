@@ -1,5 +1,6 @@
 #include "widgets/CommitGraphWidget.h"
 #include "widgets/BranchListWidget.h"
+#include "widgets/CompareWidget.h"
 
 #include <QApplication>
 #include <QAction>
@@ -11,6 +12,7 @@
 #include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QTimer>
+#include <QToolButton>
 #include <QTreeView>
 #include <QtTest>
 
@@ -52,7 +54,8 @@ class TestCommitGraphWidget : public QObject {
     }
 
     static bool triggerContextAction(CommitGraphWidget* widget, QTreeView* view,
-                                     const QString& objectName, bool* enabled)
+                                     const QString& objectName, bool* enabled,
+                                     int row = 0)
     {
         bool found = false;
         QTimer::singleShot(0, [&] {
@@ -70,7 +73,7 @@ class TestCommitGraphWidget : public QObject {
         });
         scheduleMenuFailsafe();
 
-        const QModelIndex index = view->model()->index(0, CommitGraphModel::ColMessage);
+        const QModelIndex index = view->model()->index(row, CommitGraphModel::ColMessage);
         const QPoint position = view->visualRect(index).center();
         const bool invoked = QMetaObject::invokeMethod(
             widget, "slotContextMenu", Qt::DirectConnection, Q_ARG(QPoint, position));
@@ -345,6 +348,81 @@ private slots:
         QCOMPARE(resetSpy.count(), 0);
     }
 
+    void compareActionsAndWidgetEmitRequestedRevisions()
+    {
+        const Git::Commit newer = makeCommit(QLatin1Char('a'),
+                                             QStringLiteral("newer"));
+        const Git::Commit older = makeCommit(QLatin1Char('b'),
+                                             QStringLiteral("older"),
+                                             {newer.hash});
+
+        CommitGraphWidget widget;
+        widget.resize(900, 500);
+        Git::CommitHistoryPage page;
+        page.commits = {newer, older};
+        widget.resetHistory(page);
+        widget.show();
+        QCoreApplication::processEvents();
+
+        auto* view = widget.findChild<QTreeView*>(QStringLiteral("commitHistoryView"));
+        QVERIFY(view);
+
+        QSignalSpy compareBaseSpy(&widget,
+                                  &CommitGraphWidget::sigCompareBaseSelected);
+        QSignalSpy compareSpy(&widget, &CommitGraphWidget::sigCompareRequested);
+
+        bool enabled = false;
+        QVERIFY(triggerContextAction(&widget, view,
+                                     QStringLiteral("historyCompareBaseAction"),
+                                     &enabled, 0));
+        QVERIFY(enabled);
+        QCOMPARE(compareBaseSpy.count(), 1);
+        QCOMPARE(compareBaseSpy.first().at(0).toString(), newer.hash);
+
+        QVERIFY(triggerContextAction(&widget, view,
+                                     QStringLiteral("historyCompareWithBaseAction"),
+                                     &enabled, 1));
+        QVERIFY(enabled);
+        QCOMPARE(compareSpy.count(), 1);
+        QCOMPARE(compareSpy.first().at(0).toString(), newer.hash);
+        QCOMPARE(compareSpy.first().at(1).toString(), older.hash);
+
+        QVERIFY(triggerContextAction(&widget, view,
+                                     QStringLiteral("historyCompareClearBaseAction"),
+                                     &enabled, 1));
+        QVERIFY(enabled);
+        QCOMPARE(compareBaseSpy.count(), 2);
+        QVERIFY(compareBaseSpy.at(1).at(0).toString().isEmpty());
+    }
+
+    void compareWidgetSupportsBranchAndHashSelection()
+    {
+        CompareWidget widget;
+        Git::Branch branch;
+        branch.name = QStringLiteral("main");
+        branch.fullName = QStringLiteral("refs/heads/main");
+        branch.isCurrent = true;
+        widget.setBranches({branch});
+        widget.setBaseRevision(branch.fullName);
+        widget.setTargetRevision(QString(40, QLatin1Char('c')));
+
+        auto* runButton = widget.findChild<QPushButton*>(QStringLiteral("compareRunButton"));
+        auto* swapButton = widget.findChild<QToolButton*>(QStringLiteral("compareSwapButton"));
+        QVERIFY(runButton);
+        QVERIFY(swapButton);
+        QVERIFY(runButton->isEnabled());
+
+        QSignalSpy compareSpy(&widget, &CompareWidget::sigCompareRequested);
+        runButton->click();
+        QCOMPARE(compareSpy.count(), 1);
+        QCOMPARE(compareSpy.first().at(0).toString(), branch.fullName);
+        QCOMPARE(compareSpy.first().at(1).toString(), QString(40, QLatin1Char('c')));
+
+        swapButton->click();
+        QCOMPARE(widget.baseRevision(), QString(40, QLatin1Char('c')));
+        QCOMPARE(widget.targetRevision(), branch.fullName);
+    }
+
     void branchActionsRejectCurrentBranchAndEmitTargets()
     {
         Git::Branch current;
@@ -354,19 +432,26 @@ private slots:
         Git::Branch feature;
         feature.name = QStringLiteral("feature");
         feature.fullName = QStringLiteral("refs/heads/feature");
+        Git::Branch tracked;
+        tracked.name = QStringLiteral("tracked");
+        tracked.fullName = QStringLiteral("refs/heads/tracked");
+        tracked.upstream = QStringLiteral("origin/tracked");
 
         BranchListWidget widget;
         widget.resize(360, 420);
-        widget.setBranches({current, feature});
+        widget.setBranches({current, feature, tracked});
         widget.setOperationsEnabled(true);
         widget.show();
         QCoreApplication::processEvents();
 
         QTreeWidgetItem* localRoot = widget.topLevelItem(0);
         QVERIFY(localRoot);
-        QCOMPARE(localRoot->childCount(), 2);
+        QCOMPARE(localRoot->childCount(), 3);
         QSignalSpy mergeSpy(&widget, &BranchListWidget::sigMergeRequested);
         QSignalSpy checkoutSpy(&widget, &BranchListWidget::sigCheckoutRequested);
+        QSignalSpy renameSpy(&widget, &BranchListWidget::sigRenameRequested);
+        QSignalSpy publishSpy(&widget, &BranchListWidget::sigPublishRequested);
+        QSignalSpy untrackSpy(&widget, &BranchListWidget::sigUntrackRequested);
 
         widget.setOperationsEnabled(false);
         QTest::mouseDClick(widget.viewport(), Qt::LeftButton, Qt::NoModifier,
@@ -390,6 +475,24 @@ private slots:
         QVERIFY(enabled);
         QCOMPARE(mergeSpy.count(), 1);
         QCOMPARE(mergeSpy.first().at(0).toString(), QStringLiteral("feature"));
+
+        QVERIFY(triggerBranchAction(&widget, localRoot->child(1),
+                                    QStringLiteral("branchRenameAction"), &enabled));
+        QVERIFY(enabled);
+        QCOMPARE(renameSpy.count(), 1);
+        QCOMPARE(renameSpy.first().at(0).toString(), QStringLiteral("feature"));
+
+        QVERIFY(triggerBranchAction(&widget, localRoot->child(1),
+                                    QStringLiteral("branchPublishAction"), &enabled));
+        QVERIFY(enabled);
+        QCOMPARE(publishSpy.count(), 1);
+        QCOMPARE(publishSpy.first().at(0).toString(), QStringLiteral("feature"));
+
+        QVERIFY(triggerBranchAction(&widget, localRoot->child(2),
+                                    QStringLiteral("branchUntrackAction"), &enabled));
+        QVERIFY(enabled);
+        QCOMPARE(untrackSpy.count(), 1);
+        QCOMPARE(untrackSpy.first().at(0).toString(), QStringLiteral("tracked"));
     }
 
 private:

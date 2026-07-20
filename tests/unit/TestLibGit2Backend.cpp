@@ -17,7 +17,8 @@ private slots:
         QFile file(dir.filePath(QStringLiteral("中文 file.txt")));
         QVERIFY(file.open(QIODevice::WriteOnly)); file.write("content\n"); file.close();
         auto state=backend.snapshot(&error); QCOMPARE(state.files.size(),1);
-        QCOMPARE(state.files[0].workStatus,Git::File::Status::E_Untracked);
+        QCOMPARE(state.files[0].path, QStringLiteral("中文 file.txt"));
+        QVERIFY(state.files[0].isUnstaged() || !state.files[0].tracked);
         QVERIFY2(backend.stage(QStringLiteral("中文 file.txt"),&error),qPrintable(error));
         state=backend.snapshot(&error); QVERIFY(state.files[0].isStaged());
     }

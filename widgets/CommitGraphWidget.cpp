@@ -340,6 +340,14 @@ Git::CommitHistoryQuery CommitGraphWidget::historyQuery() const
     return query;
 }
 
+QString CommitGraphWidget::compareBaseLabel() const
+{
+    return _compareBaseRevision.isEmpty()
+        ? QStringLiteral("Set as Compare Base")
+        : QStringLiteral("Set as Compare Base (%1)")
+              .arg(_compareBaseRevision.left(8));
+}
+
 void CommitGraphWidget::clear()
 {
     const bool hadSelection = !_view->selectionModel()->selectedRows().isEmpty();
@@ -465,6 +473,28 @@ void CommitGraphWidget::slotContextMenu(const QPoint& pos)
     menu.addAction(QStringLiteral("View Commit Details"), [this, hash] {
         emit sigCommitDetailsRequested(hash);
     });
+    QAction* compareBase = menu.addAction(compareBaseLabel(), [this, hash] {
+        _compareBaseRevision = hash;
+        emit sigCompareBaseSelected(hash);
+    });
+    compareBase->setObjectName(QStringLiteral("historyCompareBaseAction"));
+    if (!_compareBaseRevision.isEmpty() && _compareBaseRevision != hash) {
+        QAction* compare = menu.addAction(
+            QStringLiteral("Compare with Base (%1)")
+                .arg(_compareBaseRevision.left(8)),
+            [this, hash] {
+                emit sigCompareRequested(_compareBaseRevision, hash);
+            });
+        compare->setObjectName(QStringLiteral("historyCompareWithBaseAction"));
+    }
+    if (!_compareBaseRevision.isEmpty()) {
+        QAction* clearCompareBase = menu.addAction(QStringLiteral("Clear Compare Base"),
+                                                   [this] {
+            _compareBaseRevision.clear();
+            emit sigCompareBaseSelected({});
+        });
+        clearCompareBase->setObjectName(QStringLiteral("historyCompareClearBaseAction"));
+    }
 
     auto* parentsMenu = menu.addMenu(QStringLiteral("View Parent Commit"));
     if (commit.parents.isEmpty()) {

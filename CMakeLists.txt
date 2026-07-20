@@ -7,7 +7,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Core Widgets Concurrent)
+find_package(Qt6 REQUIRED COMPONENTS Core Widgets Concurrent Network)
 find_package(Threads REQUIRED)
 
 set(LIBGIT2_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libgit2-1.9.4" CACHE PATH "Path to bundled libgit2 source")
@@ -124,8 +124,26 @@ set(SOURCES
     core/RepositoryState.cpp
     core/GitManager.h
     core/GitManager.cpp
+    core/RepositoryWatcher.h
+    core/RepositoryWatcher.cpp
+    core/RepositoryCache.h
+    core/RepositoryCache.cpp
     core/LibGit2Backend.h
     core/LibGit2Backend.cpp
+    core/LfsService.h
+    core/LfsService.cpp
+    core/HostingService.h
+    core/HostingService.cpp
+    core/HostingApiService.h
+    core/HostingApiService.cpp
+    core/CredentialStore.h
+    core/CredentialStore.cpp
+    core/GitDiagnosticService.h
+    core/GitDiagnosticService.cpp
+    core/HookService.h
+    core/HookService.cpp
+    core/ExternalToolService.cpp
+    core/AppSettings.cpp
     core/DiffParser.h
     core/DiffParser.cpp
     widgets/CommitGraphWidget.h
@@ -138,12 +156,38 @@ set(SOURCES
     widgets/StatusWidget.cpp
     widgets/DiffWidget.h
     widgets/DiffWidget.cpp
+    widgets/CompareWidget.h
+    widgets/CompareWidget.cpp
     widgets/TerminalWidget.h
     widgets/TerminalWidget.cpp
     widgets/InteractiveRebaseWidget.h
     widgets/InteractiveRebaseWidget.cpp
+    widgets/NotificationWidget.cpp
+    widgets/WelcomeWidget.cpp
     dialogs/CommitDialog.h
     dialogs/CommitDialog.cpp
+    dialogs/BranchDialog.h
+    dialogs/BranchDialog.cpp
+    dialogs/WorktreeDialog.h
+    dialogs/WorktreeDialog.cpp
+    dialogs/SubmoduleDialog.h
+    dialogs/SubmoduleDialog.cpp
+    dialogs/LfsDialog.h
+    dialogs/LfsDialog.cpp
+    dialogs/HostingDialog.h
+    dialogs/HostingDialog.cpp
+    dialogs/HostingChangesDialog.h
+    dialogs/HostingChangesDialog.cpp
+    dialogs/HostingIssuesDialog.h
+    dialogs/HostingIssuesDialog.cpp
+    dialogs/HostingReviewDialog.h
+    dialogs/HostingReviewDialog.cpp
+    dialogs/GitDiagnosticsDialog.h
+    dialogs/GitDiagnosticsDialog.cpp
+    dialogs/HooksDialog.h
+    dialogs/HooksDialog.cpp
+    dialogs/ExternalToolsDialog.cpp
+    dialogs/SettingsDialog.cpp
     dialogs/RebaseDialog.h
     dialogs/RebaseDialog.cpp
     dialogs/ResetDialog.h
@@ -159,8 +203,12 @@ target_link_libraries(${PROJECT_NAME}
     Qt6::Core
     Qt6::Widgets
     Qt6::Concurrent
+    Qt6::Network
     libgit2package
 )
+if(WIN32)
+    target_link_libraries(${PROJECT_NAME} Advapi32)
+endif()
 gitmanager_configure_openssl_target(${PROJECT_NAME})
 gitmanager_add_openssl_deployment(GitManagerOpenSSLRuntime ${PROJECT_NAME})
 
