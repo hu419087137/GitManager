@@ -537,9 +537,14 @@ private slots:
         QVERIFY(welcome.findChild<QPushButton*>(QStringLiteral("welcomeOpenButton")));
         QVERIFY(welcome.findChild<QPushButton*>(QStringLiteral("welcomeInitButton")));
         QVERIFY(welcome.findChild<QPushButton*>(QStringLiteral("welcomeCloneButton")));
+        QCOMPARE(welcome.findChild<QPushButton*>(QStringLiteral("welcomeOpenButton"))
+                     ->accessibleName(),
+                 QStringLiteral("Open existing repository"));
         NotificationWidget notification;
         notification.showMessage(QStringLiteral("Saved"), NotificationWidget::Level::Success, 0);
         QCOMPARE(notification.text(), QStringLiteral("Saved"));
+        QCOMPARE(notification.accessibleName(),
+                 QStringLiteral("Application notification"));
         QVERIFY(notification.isVisible());
         notification.dismiss();
         QVERIFY(!notification.isVisible());

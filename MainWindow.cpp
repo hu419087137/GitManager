@@ -36,6 +36,7 @@
 #include <QTabWidget>
 #include <QStackedWidget>
 #include <QLabel>
+#include <QKeySequence>
 #include <QStatusBar>
 #include <QFileDialog>
 #include <QMessageBox>
@@ -101,6 +102,8 @@ void MainWindow::setupToolBar()
 
     auto* openAction    = tb->addAction(QStringLiteral("Open Repo"));
     auto* refreshAction = tb->addAction(QStringLiteral("Refresh"));
+    openAction->setShortcut(QKeySequence::Open);
+    refreshAction->setShortcut(QKeySequence::Refresh);
     tb->addSeparator();
 
     auto* gitMenu = new QMenu(QStringLiteral("Git"), tb);
@@ -134,6 +137,13 @@ void MainWindow::setupToolBar()
     QAction* gitMenuAction = tb->addWidget(gitButton);
 
     _cancelAction       = tb->addAction(QStringLiteral("Cancel"));
+    commitAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Return));
+    settingsAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Comma));
+    externalDiffAction->setShortcut(QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_D));
+    _cancelAction->setShortcut(QKeySequence(Qt::Key_Escape));
+    openAction->setStatusTip(QStringLiteral("Open an existing Git repository"));
+    refreshAction->setStatusTip(QStringLiteral("Refresh repository state"));
+    commitAction->setStatusTip(QStringLiteral("Commit staged changes"));
     _cancelAction->setEnabled(false);
     _operationAction->setEnabled(false);
     _repositoryActions = {refreshAction, gitMenuAction, pullAction, fetchAction,
@@ -237,6 +247,21 @@ void MainWindow::setupCentralWidget()
     _rightTabs = new QTabWidget(this);
     _rightTabs->addTab(_statusWidget, QStringLiteral("Status"));
     _rightTabs->addTab(diffPanel, QStringLiteral("Diff"));
+    _rightTabs->setAccessibleName(QStringLiteral("Repository details"));
+    auto* statusTabAction = new QAction(this);
+    statusTabAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_1));
+    statusTabAction->setShortcutContext(Qt::ApplicationShortcut);
+    addAction(statusTabAction);
+    connect(statusTabAction, &QAction::triggered, this, [this] {
+        _rightTabs->setCurrentIndex(0);
+    });
+    auto* diffTabAction = new QAction(this);
+    diffTabAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_2));
+    diffTabAction->setShortcutContext(Qt::ApplicationShortcut);
+    addAction(diffTabAction);
+    connect(diffTabAction, &QAction::triggered, this, [this] {
+        _rightTabs->setCurrentIndex(1);
+    });
     connect(_rightTabs, &QTabWidget::currentChanged, this, [this](int index) {
         setProperty("activePanel", index);
     });

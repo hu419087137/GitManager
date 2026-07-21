@@ -81,6 +81,7 @@ CommitGraphWidget::CommitGraphWidget(QWidget* parent)
 
     _orderCombo = new QComboBox(this);
     _orderCombo->setObjectName(QStringLiteral("commitOrderCombo"));
+    _orderCombo->setAccessibleName(QStringLiteral("Commit sort order"));
     _orderCombo->addItem(QStringLiteral("Newest first"), false);
     _orderCombo->addItem(QStringLiteral("Oldest first"), true);
 
@@ -92,6 +93,7 @@ CommitGraphWidget::CommitGraphWidget(QWidget* parent)
     viewButton->setAutoRaise(true);
     viewButton->setIcon(style()->standardIcon(QStyle::SP_FileDialogDetailedView));
     viewButton->setToolTip(QStringLiteral("Commit history display options"));
+    viewButton->setAccessibleName(QStringLiteral("Commit history display options"));
     viewButton->setPopupMode(QToolButton::InstantPopup);
     auto* viewMenu = new QMenu(viewButton);
     _showGraphAction = viewMenu->addAction(QStringLiteral("Show commit graph"));
@@ -105,6 +107,7 @@ CommitGraphWidget::CommitGraphWidget(QWidget* parent)
 
     _view = new QTreeView(this);
     _view->setObjectName(QStringLiteral("commitHistoryView"));
+    _view->setAccessibleName(QStringLiteral("Commit history"));
     _view->setModel(_model);
     _view->setItemDelegate(_delegate);
     _view->setRootIsDecorated(false);

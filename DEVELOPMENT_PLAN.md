@@ -201,7 +201,7 @@ tests/
 
 - [ ] `dialogs/CloneDialog.h/.cpp`
 - [ ] `dialogs/RemoteDialog.h/.cpp`
-- [ ] 持久化系统凭据保险库和代理诊断。
+- [x] 持久化系统凭据保险库和代理诊断。
 
 验收标准：
 
@@ -299,7 +299,7 @@ tests/
   - 增加 amend 和 signoff；Continue cherry-pick 时保留原作者。
 - [ ] `core/GitManager.h/.cpp`
   - 增加指定 author 和签名参数。
-- [ ] `widgets/CommitGraphWidget.cpp`
+- [x] `widgets/CommitGraphWidget.cpp`
   - 增加复制 Hash、Revert 和 Cherry-pick。
 
 验收标准：
@@ -474,16 +474,16 @@ tests/
 
 建议新增：
 
-- [ ] `.github/workflows/build.yml`
-- [ ] `cmake/DeployQt.cmake`
-- [ ] `LICENSE`
-- [ ] `CHANGELOG.md`
+- [x] `.github/workflows/build.yml`
+- [x] `cmake/DeployQt.cmake`
+- [x] `LICENSE`（MIT）
+- [x] `CHANGELOG.md`
 
 修改文件：
 
-- [ ] `CMakeLists.txt`
+- [x] `CMakeLists.txt`
   - 安装规则、版本信息、测试选项和打包配置。
-- [ ] `README.md`
+- [x] `README.md`
   - 补充安装包、测试、贡献和发布说明。
 
 验收标准：

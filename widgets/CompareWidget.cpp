@@ -16,6 +16,7 @@ CompareWidget::CompareWidget(QWidget* parent)
 
     _baseCombo = new QComboBox(this);
     _baseCombo->setObjectName(QStringLiteral("compareBaseCombo"));
+    _baseCombo->setAccessibleName(QStringLiteral("Base revision"));
     _baseCombo->setEditable(true);
     _baseCombo->setInsertPolicy(QComboBox::NoInsert);
     _baseCombo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
@@ -24,6 +25,7 @@ CompareWidget::CompareWidget(QWidget* parent)
 
     _targetCombo = new QComboBox(this);
     _targetCombo->setObjectName(QStringLiteral("compareTargetCombo"));
+    _targetCombo->setAccessibleName(QStringLiteral("Target revision"));
     _targetCombo->setEditable(true);
     _targetCombo->setInsertPolicy(QComboBox::NoInsert);
     _targetCombo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
@@ -32,11 +34,13 @@ CompareWidget::CompareWidget(QWidget* parent)
 
     auto* swapButton = new QToolButton(this);
     swapButton->setObjectName(QStringLiteral("compareSwapButton"));
+    swapButton->setAccessibleName(QStringLiteral("Swap revisions"));
     swapButton->setText(QStringLiteral("Swap"));
     swapButton->setToolTip(QStringLiteral("Swap base and target revisions"));
 
     _compareButton = new QPushButton(QStringLiteral("Show Diff"), this);
     _compareButton->setObjectName(QStringLiteral("compareRunButton"));
+    _compareButton->setAccessibleName(QStringLiteral("Compare revisions"));
 
     auto* layout = new QHBoxLayout(this);
     layout->setContentsMargins(6, 6, 6, 6);

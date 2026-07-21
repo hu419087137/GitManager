@@ -8,10 +8,12 @@ NotificationWidget::NotificationWidget(QWidget* parent)
     : QWidget(parent), _label(new QLabel(this)), _timer(new QTimer(this))
 {
     setObjectName(QStringLiteral("notificationWidget"));
+    setAccessibleName(QStringLiteral("Application notification"));
     setVisible(false);
     _label->setWordWrap(true);
     auto* close = new QPushButton(QStringLiteral("x"), this);
     close->setObjectName(QStringLiteral("notificationCloseButton"));
+    close->setAccessibleName(QStringLiteral("Dismiss notification"));
     close->setFixedSize(28, 28);
     close->setToolTip(QStringLiteral("Dismiss notification"));
     auto* layout = new QHBoxLayout(this);

@@ -1,0 +1,55 @@
+name: Windows Release
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test-package:
+    runs-on: windows-2022
+    env:
+      BUILD_DIR: ${{ github.workspace }}\build\ci
+      DEPLOY_DIR: ${{ github.workspace }}\build\deploy\GitManager
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt 6.7.3
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.7.3'
+          arch: win64_msvc2019_64
+          cache: true
+
+      - name: Configure
+        shell: pwsh
+        run: >-
+          cmake -S . -B $env:BUILD_DIR -G "Visual Studio 17 2022" -A x64
+          -DGITMANAGER_USE_PREBUILT_OPENSSL=ON
+          -DCMAKE_INSTALL_PREFIX="$env:BUILD_DIR/install"
+
+      - name: Build
+        run: cmake --build "%BUILD_DIR%" --config Release --parallel
+        shell: cmd
+
+      - name: Test
+        run: ctest --test-dir "%BUILD_DIR%" -C Release --output-on-failure
+        shell: cmd
+
+      - name: Deploy Qt runtime
+        shell: pwsh
+        run: >-
+          cmake
+          -DAPP_EXECUTABLE="$env:BUILD_DIR\Release\GitManager.exe"
+          -DDEPLOY_DIRECTORY="$env:DEPLOY_DIR"
+          -DWINDEPLOYQT_EXECUTABLE="$env:QT_ROOT_DIR\bin\windeployqt.exe"
+          -DOPENSSL_SSL_RUNTIME="${{ github.workspace }}\third_party\OpenSSLv3.0.16\Win_x64\bin\libssl-3-x64.dll"
+          -DOPENSSL_CRYPTO_RUNTIME="${{ github.workspace }}\third_party\OpenSSLv3.0.16\Win_x64\bin\libcrypto-3-x64.dll"
+          -DOPENSSL_CA_BUNDLE="${{ github.workspace }}\third_party\OpenSSLv3.0.16\certs\cacert.pem"
+          -P cmake/DeployQt.cmake
+
+      - name: Upload portable application
+        uses: actions/upload-artifact@v4
+        with:
+          name: GitManager-Windows-x64
+          path: ${{ env.DEPLOY_DIR }}
+          if-no-files-found: error

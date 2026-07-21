@@ -34,6 +34,10 @@ StatusWidget::StatusWidget(QWidget* parent) : QWidget(parent)
     _list = new QListWidget(this);
     _stageAllBtn = new QPushButton(QStringLiteral("Stage All"), this);
     _unstageAllBtn = new QPushButton(QStringLiteral("Unstage All"), this);
+    _summaryLabel->setAccessibleName(QStringLiteral("Working tree summary"));
+    _list->setAccessibleName(QStringLiteral("Changed files"));
+    _stageAllBtn->setAccessibleName(QStringLiteral("Stage all changed files"));
+    _unstageAllBtn->setAccessibleName(QStringLiteral("Unstage all staged files"));
     _list->setContextMenuPolicy(Qt::CustomContextMenu);
     _list->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     _list->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);

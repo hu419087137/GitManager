@@ -86,6 +86,7 @@ RepoListWidget::RepoListWidget(QWidget* parent)
     auto* addBtn = new QToolButton(this);
     addBtn->setText(QStringLiteral("+"));
     addBtn->setToolTip(QStringLiteral("Add repository…"));
+    addBtn->setAccessibleName(QStringLiteral("Add repository"));
     addBtn->setAutoRaise(true);
 
     auto* headerLayout = new QHBoxLayout;
@@ -96,6 +97,7 @@ RepoListWidget::RepoListWidget(QWidget* parent)
 
     // ---- 树控件 ----
     _tree = new QTreeWidget(this);
+    _tree->setAccessibleName(QStringLiteral("Repositories"));
     _tree->setHeaderHidden(true);
     _tree->setIndentation(12);
     _tree->setContextMenuPolicy(Qt::CustomContextMenu);

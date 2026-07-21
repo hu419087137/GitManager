@@ -20,6 +20,9 @@ WelcomeWidget::WelcomeWidget(QWidget* parent)
     open->setObjectName(QStringLiteral("welcomeOpenButton"));
     init->setObjectName(QStringLiteral("welcomeInitButton"));
     clone->setObjectName(QStringLiteral("welcomeCloneButton"));
+    open->setAccessibleName(QStringLiteral("Open existing repository"));
+    init->setAccessibleName(QStringLiteral("Initialize new repository"));
+    clone->setAccessibleName(QStringLiteral("Clone remote repository"));
     for (QPushButton* button : {open, init, clone}) button->setMinimumWidth(240);
     auto* layout = new QVBoxLayout(this);
     layout->addStretch(2);

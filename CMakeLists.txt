@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(GitManager VERSION 1.0.0 LANGUAGES C CXX)
 
+include(GNUInstallDirs)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
@@ -215,6 +217,19 @@ gitmanager_add_openssl_deployment(GitManagerOpenSSLRuntime ${PROJECT_NAME})
 if(WIN32)
     set_target_properties(${PROJECT_NAME} PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()
+
+install(TARGETS ${PROJECT_NAME}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    BUNDLE DESTINATION .)
+if(GITMANAGER_USE_PREBUILT_OPENSSL)
+    if(OPENSSL_SSL_RUNTIME AND OPENSSL_CRYPTO_RUNTIME)
+        install(FILES "${OPENSSL_SSL_RUNTIME}" "${OPENSSL_CRYPTO_RUNTIME}"
+                DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endif()
+    install(FILES "${OPENSSL_CA_BUNDLE}"
+            DESTINATION "${CMAKE_INSTALL_BINDIR}/certs")
+endif()
+install(FILES README.md CHANGELOG.md LICENSE DESTINATION .)
 
 include(CTest)
 if(BUILD_TESTING)
