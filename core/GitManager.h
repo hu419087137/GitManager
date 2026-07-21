@@ -46,6 +46,9 @@ public:
     void fetchCommitDiff(const QString& commitHash);
     void fetchRevisionDiff(const QString& baseRevision,
                            const QString& targetRevision);
+    void requestExternalDiff(const QString& filePath, bool staged,
+                             bool untracked = false);
+    void requestExternalMerge(const QString& filePath);
     void stageFile(const QString& filePath);
     void unstageFile(const QString& filePath);
     void stageAll();
@@ -123,6 +126,10 @@ signals:
                                      const QString& message);
     void sigDiffReady(const QString& diff, const QString& title,
                       bool staged, bool hunkActionsEnabled);
+    void sigExternalDiffReady(const Git::ExternalDiffInput& input,
+                              const QString& error);
+    void sigExternalMergeReady(const Git::ExternalMergeInput& input,
+                               const QString& error);
     void sigStashesReady(const QStringList& stashes);
     void sigLfsStateReady(const Git::LfsState& state, const QString& error);
     void sigHostingRemotesReady(const QVector<Git::HostingRemoteInfo>& remotes,

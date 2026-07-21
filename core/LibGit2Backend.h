@@ -45,6 +45,11 @@ public:
     QString revisionDiff(const QString& baseRevision,
                          const QString& targetRevision,
                          QString* error = nullptr) const;
+    ExternalDiffInput externalDiffInput(const QString& path, bool staged,
+                                        bool untracked,
+                                        QString* error = nullptr) const;
+    ExternalMergeInput externalMergeInput(const QString& path,
+                                          QString* error = nullptr) const;
 
     bool stage(const QString& path, QString* error = nullptr);
     bool unstage(const QString& path, QString* error = nullptr);

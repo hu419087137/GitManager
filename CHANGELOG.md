@@ -12,6 +12,7 @@ All notable changes to Git Manager are documented in this file.
 - Force-with-lease push protection and configurable external Diff/Merge tools.
 - Persistent layout settings, welcome view, notifications, shortcuts, and accessibility labels.
 - Windows Release CI with automated tests and a portable `windeployqt` artifact.
+- Two-file external Diff inputs and base/ours/theirs external Merge integration.
 
 ### Changed
 

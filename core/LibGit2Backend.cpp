@@ -66,6 +66,7 @@ private:
 };
 
 using AnnotatedHandle = GitHandle<git_annotated_commit, git_annotated_commit_free>;
+using BlobHandle = GitHandle<git_blob, git_blob_free>;
 using CommitHandle = GitHandle<git_commit, git_commit_free>;
 using ConfigHandle = GitHandle<git_config, git_config_free>;
 using ConfigIteratorHandle = GitHandle<git_config_iterator, git_config_iterator_free>;
@@ -157,6 +158,20 @@ bool lookupHeadTree(git_repository* repository, TreeHandle& tree)
     CommitHandle commit;
     return lookupHeadCommit(repository, commit)
         && git_commit_tree(tree.out(), commit.get()) == 0;
+}
+
+QByteArray blobData(git_repository* repository, const git_oid* oid,
+                    QString* error)
+{
+    if (!oid) return {};
+    BlobHandle blob;
+    if (git_blob_lookup(blob.out(), repository, oid) < 0) {
+        fail(error, QStringLiteral("Cannot read file content from Git."));
+        return {};
+    }
+    const auto size = static_cast<qsizetype>(git_blob_rawsize(blob.get()));
+    const auto* data = static_cast<const char*>(git_blob_rawcontent(blob.get()));
+    return data && size > 0 ? QByteArray(data, size) : QByteArray();
 }
 
 bool lookupCommit(git_repository* repository, const QString& revision,
@@ -1933,6 +1948,81 @@ QString LibGit2Backend::revisionDiff(const QString& baseRevision,
         return {};
     }
     return output + patch;
+}
+
+ExternalDiffInput LibGit2Backend::externalDiffInput(
+    const QString& path, bool staged, bool untracked, QString* error) const
+{
+    ExternalDiffInput result;
+    result.path = path;
+    if (!ensureRepository(_repository, error)) return result;
+
+    IndexHandle index;
+    if (git_repository_index(index.out(), _repository) < 0) {
+        fail(error, QStringLiteral("Cannot open repository index."));
+        return result;
+    }
+    const QByteArray pathBytes = path.toUtf8();
+    const git_index_entry* indexEntry = git_index_get_bypath(
+        index.get(), pathBytes.constData(), 0);
+
+    if (staged) {
+        const QString oldPath = renamedFrom(_repository, path, true);
+        const QByteArray headPath = (oldPath.isEmpty() ? path : oldPath).toUtf8();
+        TreeHandle tree;
+        TreeEntryHandle entry;
+        if (lookupHeadTree(_repository, tree)
+            && git_tree_entry_bypath(entry.out(), tree.get(), headPath.constData()) == 0) {
+            result.left = blobData(_repository, git_tree_entry_id(entry.get()), error);
+        } else {
+            git_error_clear();
+        }
+        if (error && !error->isEmpty()) return result;
+        if (indexEntry)
+            result.right = blobData(_repository, &indexEntry->id, error);
+        return result;
+    }
+
+    if (!untracked && indexEntry)
+        result.left = blobData(_repository, &indexEntry->id, error);
+    if (error && !error->isEmpty()) return result;
+    QFile working(QDir(rootPath()).filePath(path));
+    if (working.exists()) {
+        if (!working.open(QIODevice::ReadOnly)) {
+            if (error) *error = working.errorString();
+            return result;
+        }
+        result.right = working.readAll();
+    }
+    return result;
+}
+
+ExternalMergeInput LibGit2Backend::externalMergeInput(
+    const QString& path, QString* error) const
+{
+    ExternalMergeInput result;
+    result.path = path;
+    if (!ensureRepository(_repository, error)) return result;
+    IndexHandle index;
+    if (git_repository_index(index.out(), _repository) < 0) {
+        fail(error, QStringLiteral("Cannot open repository index."));
+        return result;
+    }
+    const git_index_entry* ancestor = nullptr;
+    const git_index_entry* local = nullptr;
+    const git_index_entry* remote = nullptr;
+    const QByteArray pathBytes = path.toUtf8();
+    if (git_index_conflict_get(&ancestor, &local, &remote, index.get(),
+                               pathBytes.constData()) < 0) {
+        fail(error, QStringLiteral("File is not conflicted."));
+        return result;
+    }
+    if (ancestor) result.base = blobData(_repository, &ancestor->id, error);
+    if (error && !error->isEmpty()) return result;
+    if (local) result.local = blobData(_repository, &local->id, error);
+    if (error && !error->isEmpty()) return result;
+    if (remote) result.remote = blobData(_repository, &remote->id, error);
+    return result;
 }
 
 bool LibGit2Backend::stage(const QString& path, QString* error)

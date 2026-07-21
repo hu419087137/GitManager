@@ -2,6 +2,7 @@
 #include <QFont>
 #include <QLabel>
 #include <QPushButton>
+#include <QFileInfo>
 #include <QVBoxLayout>
 
 WelcomeWidget::WelcomeWidget(QWidget* parent)
@@ -31,8 +32,40 @@ WelcomeWidget::WelcomeWidget(QWidget* parent)
     layout->addWidget(open, 0, Qt::AlignHCenter);
     layout->addWidget(init, 0, Qt::AlignHCenter);
     layout->addWidget(clone, 0, Qt::AlignHCenter);
+    _recentLayout = new QVBoxLayout;
+    _recentLayout->setSpacing(4);
+    layout->addSpacing(16);
+    layout->addLayout(_recentLayout);
     layout->addStretch(3);
     connect(open, &QPushButton::clicked, this, &WelcomeWidget::sigOpenRequested);
     connect(init, &QPushButton::clicked, this, &WelcomeWidget::sigInitRequested);
     connect(clone, &QPushButton::clicked, this, &WelcomeWidget::sigCloneRequested);
+}
+
+void WelcomeWidget::setRecentRepositories(const QStringList& paths)
+{
+    while (QLayoutItem* item = _recentLayout->takeAt(0)) {
+        delete item->widget();
+        delete item;
+    }
+    if (paths.isEmpty())
+        return;
+
+    auto* heading = new QLabel(QStringLiteral("Recent Repositories"), this);
+    heading->setAlignment(Qt::AlignCenter);
+    _recentLayout->addWidget(heading);
+    for (qsizetype index = 0; index < paths.size(); ++index) {
+        const QString& path = paths.at(index);
+        auto* button = new QPushButton(QFileInfo(path).fileName(), this);
+        button->setObjectName(
+            QStringLiteral("welcomeRecentButton_%1").arg(index));
+        button->setToolTip(path);
+        button->setAccessibleName(
+            QStringLiteral("Open recent repository %1").arg(path));
+        button->setMinimumWidth(240);
+        button->setMaximumWidth(420);
+        _recentLayout->addWidget(button, 0, Qt::AlignHCenter);
+        connect(button, &QPushButton::clicked, this,
+                [this, path] { emit sigRecentRepositoryRequested(path); });
+    }
 }

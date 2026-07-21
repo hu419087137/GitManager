@@ -58,16 +58,32 @@ void RepoListWidget::saveEntries(const QVector<RepoEntry>& entries)
 void RepoListWidget::recordRepo(const QString& path)
 {
     auto entries = loadEntries();
-
-    // 已存在则不重排，直接返回
-    for (const RepoEntry& e : entries) {
-        if (e.path == path)
-            return;
-    }
-
-    // 新仓库追加到列表末尾（保持手动排列顺序）
-    entries.append({path, kDefaultGroup});
+    const QString cleanPath = QDir::cleanPath(path);
+    QString group = kDefaultGroup;
+    entries.erase(std::remove_if(entries.begin(), entries.end(),
+        [&cleanPath, &group](const RepoEntry& entry) {
+            if (QDir::cleanPath(entry.path).compare(
+                    cleanPath, Qt::CaseInsensitive) != 0) return false;
+            group = entry.group.isEmpty() ? kDefaultGroup : entry.group;
+            return true;
+        }), entries.end());
+    entries.append({cleanPath, group});
     saveEntries(entries);
+}
+
+QStringList RepoListWidget::recentRepositoryPaths(int limit)
+{
+    QStringList paths;
+    if (limit <= 0)
+        return paths;
+
+    const auto entries = loadEntries();
+    for (auto it = entries.crbegin(); it != entries.crend() && paths.size() < limit; ++it) {
+        const QString path = QDir::cleanPath(it->path);
+        if (QFileInfo(path).isDir() && !paths.contains(path, Qt::CaseInsensitive))
+            paths.append(path);
+    }
+    return paths;
 }
 
 // ============================================================

@@ -48,6 +48,9 @@
 #include <QRegularExpression>
 #include <QToolButton>
 #include <QDesktopServices>
+#include <QClipboard>
+#include <QGuiApplication>
+#include <QProcess>
 
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
@@ -235,6 +238,7 @@ void MainWindow::setupCentralWidget()
     _terminalWidget = new TerminalWidget(this);
     _notification = new NotificationWidget(this);
     _welcomeWidget = new WelcomeWidget(this);
+    _welcomeWidget->setRecentRepositories(RepoListWidget::recentRepositoryPaths());
 
     auto* diffPanel = new QWidget(this);
     auto* diffLayout = new QVBoxLayout(diffPanel);
@@ -318,6 +322,8 @@ void MainWindow::setupCentralWidget()
             this, &MainWindow::slotInitRepo);
     connect(_welcomeWidget, &WelcomeWidget::sigCloneRequested,
             this, &MainWindow::slotCloneRepo);
+    connect(_welcomeWidget, &WelcomeWidget::sigRecentRepositoryRequested,
+            this, &MainWindow::slotRepoSelected);
 }
 
 void MainWindow::connectSignals()
@@ -492,6 +498,24 @@ void MainWindow::connectSignals()
         _diffWidget->setDiff(diff, actions);
         _rightTabs->setCurrentIndex(1);
     });
+    connect(_git, &Git::GitManager::sigExternalDiffReady, this,
+            [this](const Git::ExternalDiffInput& input, const QString& inputError) {
+        QString error = inputError;
+        if (error.isEmpty()
+            && Git::ExternalToolService::launchDiff(
+                _git->repositoryPath(), input, &error)) return;
+        if (_notification)
+            _notification->showMessage(error, NotificationWidget::Level::Error);
+    });
+    connect(_git, &Git::GitManager::sigExternalMergeReady, this,
+            [this](const Git::ExternalMergeInput& input, const QString& inputError) {
+        QString error = inputError;
+        if (error.isEmpty()
+            && Git::ExternalToolService::launchMerge(
+                _git->repositoryPath(), input, &error)) return;
+        if (_notification)
+            _notification->showMessage(error, NotificationWidget::Level::Error);
+    });
     connect(_git, &Git::GitManager::sigOperationFinished,
             this, &MainWindow::slotOperationFinished);
     connect(_git, &Git::GitManager::sigBusyChanged,
@@ -592,6 +616,14 @@ void MainWindow::connectSignals()
             this, &MainWindow::slotDiscardFile);
     connect(_statusWidget, &StatusWidget::sigResolveRequested,
             this, &MainWindow::slotResolveFile);
+    connect(_statusWidget, &StatusWidget::sigExternalMergeRequested,
+            this, &MainWindow::slotExternalMerge);
+    connect(_statusWidget, &StatusWidget::sigOpenFileRequested,
+            this, &MainWindow::slotOpenFile);
+    connect(_statusWidget, &StatusWidget::sigRevealFileRequested,
+            this, &MainWindow::slotRevealFile);
+    connect(_statusWidget, &StatusWidget::sigCopyPathRequested,
+            this, &MainWindow::slotCopyFilePath);
 
     connect(_branchList, &BranchListWidget::sigCheckoutRequested,
             this, &MainWindow::slotCheckoutBranch);
@@ -970,6 +1002,8 @@ void MainWindow::slotFileSelected(const QString& filePath, bool staged, bool unt
         return;
     _requestedDiffSource = DiffSource::File;
     _currentDiffPath = filePath;
+    _currentDiffStaged = staged;
+    _currentDiffUntracked = untracked;
     _git->fetchFileDiff(filePath, staged, untracked);
 }
 
@@ -985,10 +1019,52 @@ void MainWindow::slotExternalDiff()
                                  QStringLiteral("Select a file diff first."));
         return;
     }
-    QString error;
-    const QString file = QDir(_git->repositoryPath()).filePath(_currentDiffPath);
-    if (!Git::ExternalToolService::launchDiff(_git->repositoryPath(), file, &error))
-        QMessageBox::warning(this, QStringLiteral("External Diff"), error);
+    _git->requestExternalDiff(_currentDiffPath, _currentDiffStaged,
+                              _currentDiffUntracked);
+}
+
+void MainWindow::slotExternalMerge(const QString& filePath)
+{
+    if (!_git->isValid() || filePath.isEmpty()) return;
+    _git->requestExternalMerge(filePath);
+}
+
+void MainWindow::slotOpenFile(const QString& filePath)
+{
+    const QString absolute = QDir(_git->repositoryPath()).filePath(filePath);
+    if (!QFileInfo::exists(absolute)
+        || !QDesktopServices::openUrl(QUrl::fromLocalFile(absolute))) {
+        _notification->showMessage(
+            QStringLiteral("Cannot open file: %1").arg(filePath),
+            NotificationWidget::Level::Error);
+    }
+}
+
+void MainWindow::slotRevealFile(const QString& filePath)
+{
+    const QString absolute = QDir::toNativeSeparators(
+        QDir(_git->repositoryPath()).filePath(filePath));
+#ifdef Q_OS_WIN
+    if (QFileInfo::exists(absolute)
+        && QProcess::startDetached(QStringLiteral("explorer.exe"),
+                                   {QStringLiteral("/select,"), absolute})) return;
+#endif
+    const QString folder = QFileInfo(absolute).absolutePath();
+    if (!QDesktopServices::openUrl(QUrl::fromLocalFile(folder))) {
+        _notification->showMessage(
+            QStringLiteral("Cannot open folder: %1").arg(folder),
+            NotificationWidget::Level::Error);
+    }
+}
+
+void MainWindow::slotCopyFilePath(const QString& filePath, bool absolute)
+{
+    const QString value = absolute
+        ? QDir::toNativeSeparators(QDir(_git->repositoryPath()).filePath(filePath))
+        : filePath;
+    QGuiApplication::clipboard()->setText(value);
+    _notification->showMessage(QStringLiteral("Copied path: %1").arg(value),
+                               NotificationWidget::Level::Success, 2500);
 }
 
 void MainWindow::slotStageFile(const QString& filePath)
@@ -1291,6 +1367,9 @@ void MainWindow::beginRepositoryTransition(const QString& path)
     _diffWidget->setEnabled(false);
     _requestedDiffSource = DiffSource::None;
     _displayedDiffSource = DiffSource::None;
+    _currentDiffPath.clear();
+    _currentDiffStaged = false;
+    _currentDiffUntracked = false;
     _watcher->setRepositoryPath({});
     _rightTabs->setCurrentWidget(_statusWidget);
     _repoList->setCurrentRepo({});
@@ -1344,6 +1423,7 @@ void MainWindow::slotRepositoryOpened(const QString& path, bool success, const Q
         _centralStack->setCurrentIndex(1);
     RepoListWidget::recordRepo(path);
     _repoList->setCurrentRepo(path);
+    _welcomeWidget->setRecentRepositories(RepoListWidget::recentRepositoryPaths());
     QSettings settings;
     settings.setValue(QStringLiteral("lastRepo"), path);
     settings.sync();

@@ -48,6 +48,10 @@ signals:
     void sigIgnoreRequested(const QString& filePath);
     void sigDiscardRequested(const QString& filePath, bool untracked);
     void sigResolveRequested(const QString& filePath, bool ours);
+    void sigExternalMergeRequested(const QString& filePath);
+    void sigOpenFileRequested(const QString& filePath);
+    void sigRevealFileRequested(const QString& filePath);
+    void sigCopyPathRequested(const QString& filePath, bool absolute);
 
 private slots:
     void slotItemChanged(QListWidgetItem* item);

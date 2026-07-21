@@ -33,10 +33,13 @@ public:
     /**
      * @brief 将路径写入历史记录
      *
-     * 若路径已存在则移到最前；否则追加到 "Default" 分组最前。
+     * 若路径已存在则保留分组并更新最近顺序；否则加入 "Default" 分组。
      * 在 MainWindow 成功打开仓库后调用。
      */
     static void recordRepo(const QString& path);
+
+    /** @brief 返回最近打开的有效仓库路径（新到旧） */
+    static QStringList recentRepositoryPaths(int limit = 5);
 
 signals:
     /** @brief 用户点击某个仓库条目时发射 */

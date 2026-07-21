@@ -584,6 +584,64 @@ private slots:
         QVERIFY(found);
     }
 
+    void providesExternalDiffAndMergeInputs()
+    {
+        QTemporaryDir diffDir;
+        QVERIFY(diffDir.isValid());
+        Git::LibGit2Backend diffBackend;
+        QString error;
+        QVERIFY2(initializeConfigured(diffBackend, diffDir.path(), &error),
+                 qPrintable(error));
+        QVERIFY2(commitFiles(diffBackend, diffDir.path(),
+                             {{QStringLiteral("compare.txt"), "base\n"}},
+                             QStringLiteral("base"), nullptr, &error),
+                 qPrintable(error));
+        QFile comparison(diffDir.filePath(QStringLiteral("compare.txt")));
+        QVERIFY(comparison.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        comparison.write("working\n");
+        comparison.close();
+
+        auto input = diffBackend.externalDiffInput(
+            QStringLiteral("compare.txt"), false, false, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(input.left, QByteArray("base\n"));
+        QCOMPARE(input.right, QByteArray("working\n"));
+        QVERIFY(diffBackend.stage(QStringLiteral("compare.txt"), &error));
+        input = diffBackend.externalDiffInput(
+            QStringLiteral("compare.txt"), true, false, &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(input.left, QByteArray("base\n"));
+        QCOMPARE(input.right, QByteArray("working\n"));
+
+        QTemporaryDir mergeDir;
+        QVERIFY(mergeDir.isValid());
+        Git::LibGit2Backend mergeBackend;
+        QVERIFY2(initializeConfigured(mergeBackend, mergeDir.path(), &error),
+                 qPrintable(error));
+        QVERIFY(commitFiles(mergeBackend, mergeDir.path(),
+                            {{QStringLiteral("conflict.txt"), "base\n"}},
+                            QStringLiteral("base"), nullptr, &error));
+        const QString mainBranch = mergeBackend.snapshot(&error).headName;
+        QVERIFY(mergeBackend.createBranch(QStringLiteral("feature"), {}, &error));
+        QVERIFY(commitFiles(mergeBackend, mergeDir.path(),
+                            {{QStringLiteral("conflict.txt"), "remote\n"}},
+                            QStringLiteral("remote"), nullptr, &error));
+        QVERIFY(mergeBackend.checkoutBranch(mainBranch, &error));
+        QVERIFY(commitFiles(mergeBackend, mergeDir.path(),
+                            {{QStringLiteral("conflict.txt"), "local\n"}},
+                            QStringLiteral("local"), nullptr, &error));
+        const auto mergeResult = mergeBackend.mergeRevision(
+            QStringLiteral("feature"), &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(mergeResult.status, Git::HistoryOperationStatus::Conflicts);
+        const auto mergeInput = mergeBackend.externalMergeInput(
+            QStringLiteral("conflict.txt"), &error);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(mergeInput.base, QByteArray("base\n"));
+        QCOMPARE(mergeInput.local, QByteArray("local\n"));
+        QCOMPARE(mergeInput.remote, QByteArray("remote\n"));
+    }
+
     void renamesBranchAndRemovesUpstream()
     {
         QTemporaryDir localDir;

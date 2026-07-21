@@ -7,6 +7,7 @@
 #include <QMetaType>
 #include <QVector>
 #include <QColor>
+#include <QByteArray>
 
 namespace Git {
 
@@ -191,6 +192,19 @@ struct HookResult {
     bool timedOut {false};
 };
 
+struct ExternalDiffInput {
+    QString path;
+    QByteArray left;
+    QByteArray right;
+};
+
+struct ExternalMergeInput {
+    QString path;
+    QByteArray base;
+    QByteArray local;
+    QByteArray remote;
+};
+
 /** @brief 单次提交信息 */
 struct Commit {
     QString hash;
@@ -354,5 +368,7 @@ Q_DECLARE_METATYPE(Git::DiagnosticItem)
 Q_DECLARE_METATYPE(Git::GitDiagnosticReport)
 Q_DECLARE_METATYPE(Git::HookInfo)
 Q_DECLARE_METATYPE(Git::HookResult)
+Q_DECLARE_METATYPE(Git::ExternalDiffInput)
+Q_DECLARE_METATYPE(Git::ExternalMergeInput)
 
 #endif // GITTYPES_H

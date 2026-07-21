@@ -194,8 +194,8 @@ tests/
   - Push 遵循已配置 upstream 的远程目标分支。
 - [x] `MainWindow.h/.cpp`
   - 增加 Clone、Init、Fetch 入口和进度展示。
-- [ ] `widgets/RepoListWidget.h/.cpp`
-  - 欢迎页支持 Clone 和打开最近仓库。
+- [x] `widgets/RepoListWidget.h/.cpp`、`widgets/WelcomeWidget.h/.cpp`
+  - 欢迎页支持 Clone，并显示最多 5 个有效的最近仓库供一键打开。
 
 建议新增：
 
@@ -221,8 +221,8 @@ tests/
 - [x] `widgets/StatusWidget.h/.cpp`
   - 增加文件级暂存、取消暂存和丢弃。
   - 危险操作展示文件范围并确认。
-- [ ] `widgets/StatusWidget.h/.cpp`
-  - 增加打开文件和打开所在目录。
+- [x] `widgets/StatusWidget.h/.cpp`
+  - 增加打开文件、打开所在目录，以及复制相对/绝对路径。
 - [x] `MainWindow.h/.cpp`
   - 统一处理操作结果和局部刷新。
 
@@ -430,7 +430,7 @@ tests/
 - [x] SSH、凭据、代理诊断页面：Git/SSH 工具、credential helper、代理、TLS/CA、环境变量及远程协议检查完成；远程连通性测试按需执行并脱敏输出。
 - [x] Git hooks：仓库 hooks 列表、pre/post-commit 执行、超时控制，以及输出和失败提示已完成。
 - [x] Force-with-lease：普通 Push 保持非强制；独立命令经确认后校验服务器分支与本地 remote-tracking OID，一致时才允许安全重写。
-- [x] 可配置外部 Diff/Merge 工具：设置命令模板、持久化配置和当前文件外部 Diff 入口已完成。
+- [x] 可配置外部 Diff/Merge 工具：支持持久化命令模板；外部 Diff 使用 HEAD/index/worktree 双文件，冲突菜单向外部 Merge 传递 base/ours/theirs/merged。
 
 ---
 

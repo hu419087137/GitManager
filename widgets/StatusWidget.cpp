@@ -124,6 +124,15 @@ void StatusWidget::slotContextMenu(const QPoint& pos)
     const QString path = item->data(kRolePath).toString();
     QMenu menu(this);
     menu.addAction(QStringLiteral("Show Diff"), [this, item] { slotItemClicked(item); });
+    menu.addAction(QStringLiteral("Open File"),
+                   [this, path] { emit sigOpenFileRequested(path); });
+    menu.addAction(QStringLiteral("Open Containing Folder"),
+                   [this, path] { emit sigRevealFileRequested(path); });
+    auto* copyMenu = menu.addMenu(QStringLiteral("Copy Path"));
+    copyMenu->addAction(QStringLiteral("Relative Path"),
+                        [this, path] { emit sigCopyPathRequested(path, false); });
+    copyMenu->addAction(QStringLiteral("Absolute Path"),
+                        [this, path] { emit sigCopyPathRequested(path, true); });
     if (item->data(kRoleUntracked).toBool()) {
         menu.addSeparator();
         menu.addAction(QStringLiteral("Add to .gitignore"), [this, path] { emit sigIgnoreRequested(path); });
@@ -136,6 +145,8 @@ void StatusWidget::slotContextMenu(const QPoint& pos)
         menu.addSeparator();
         menu.addAction(QStringLiteral("Accept Current"), [this, path] { emit sigResolveRequested(path, true); });
         menu.addAction(QStringLiteral("Accept Incoming"), [this, path] { emit sigResolveRequested(path, false); });
+        menu.addAction(QStringLiteral("Open in External Merge Tool"),
+                       [this, path] { emit sigExternalMergeRequested(path); });
     }
     menu.exec(_list->mapToGlobal(pos));
 }

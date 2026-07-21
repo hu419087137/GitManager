@@ -643,6 +643,37 @@ void GitManager::fetchRevisionDiff(const QString& baseRevision,
     });
 }
 
+void GitManager::requestExternalDiff(const QString& path, bool staged,
+                                     bool untracked)
+{
+    enqueue(QStringLiteral("external-diff"),
+            [path, staged, untracked](LibGit2Backend& backend) {
+        TaskResult result;
+        const ExternalDiffInput input = backend.externalDiffInput(
+            path, staged, untracked, &result.error);
+        const QString error = result.error;
+        result.applyOnError = true;
+        result.apply = [input, error](GitManager& manager) {
+            emit manager.sigExternalDiffReady(input, error);
+        };
+        return result;
+    }, true, false, false);
+}
+
+void GitManager::requestExternalMerge(const QString& path)
+{
+    enqueue(QStringLiteral("external-merge"), [path](LibGit2Backend& backend) {
+        TaskResult result;
+        const ExternalMergeInput input = backend.externalMergeInput(path, &result.error);
+        const QString error = result.error;
+        result.applyOnError = true;
+        result.apply = [input, error](GitManager& manager) {
+            emit manager.sigExternalMergeReady(input, error);
+        };
+        return result;
+    }, true, false, false);
+}
+
 void GitManager::stageFile(const QString& path)
 {
     runBoolean(QStringLiteral("stage"), [path](auto& backend, auto* error) {

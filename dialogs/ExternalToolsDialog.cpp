@@ -20,7 +20,8 @@ ExternalToolsDialog::ExternalToolsDialog(QWidget* parent)
     form->addRow(QStringLiteral("Diff command:"), _diffEdit);
     form->addRow(QStringLiteral("Merge command:"), _mergeEdit);
     auto* hint = new QLabel(QStringLiteral(
-        "Placeholders: Diff uses {file} and {repo}; Merge uses {base}, {local}, {remote}, {merged}."), this);
+        "Placeholders are quoted automatically. Diff: {left}, {right}, {file}, {repo}. "
+        "Merge: {base}, {local}, {remote}, {merged}, {repo}."), this);
     hint->setWordWrap(true);
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     auto* layout = new QVBoxLayout(this);

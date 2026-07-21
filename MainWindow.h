@@ -54,6 +54,10 @@ private slots:
     void slotHooks();
     void slotExternalTools();
     void slotExternalDiff();
+    void slotExternalMerge(const QString& filePath);
+    void slotOpenFile(const QString& filePath);
+    void slotRevealFile(const QString& filePath);
+    void slotCopyFilePath(const QString& filePath, bool absolute);
     void slotStash();
     void slotRepositoryOperation();
     void slotRefresh();
@@ -156,6 +160,8 @@ private:
     DiffSource _requestedDiffSource {DiffSource::None};
     DiffSource _displayedDiffSource {DiffSource::None};
     QString _currentDiffPath;
+    bool _currentDiffStaged {false};
+    bool _currentDiffUntracked {false};
 };
 
 #endif // MAINWINDOW_H

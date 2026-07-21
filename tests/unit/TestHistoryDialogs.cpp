@@ -540,6 +540,18 @@ private slots:
         QCOMPARE(welcome.findChild<QPushButton*>(QStringLiteral("welcomeOpenButton"))
                      ->accessibleName(),
                  QStringLiteral("Open existing repository"));
+        welcome.setRecentRepositories(
+            {QStringLiteral("C:/work/repo-a"), QStringLiteral("C:/work/repo-b")});
+        auto* recent = welcome.findChild<QPushButton*>(
+            QStringLiteral("welcomeRecentButton_0"));
+        QVERIFY(recent);
+        QCOMPARE(recent->text(), QStringLiteral("repo-a"));
+        QSignalSpy recentSpy(&welcome,
+                             &WelcomeWidget::sigRecentRepositoryRequested);
+        recent->click();
+        QCOMPARE(recentSpy.count(), 1);
+        QCOMPARE(recentSpy.takeFirst().at(0).toString(),
+                 QStringLiteral("C:/work/repo-a"));
         NotificationWidget notification;
         notification.showMessage(QStringLiteral("Saved"), NotificationWidget::Level::Success, 0);
         QCOMPARE(notification.text(), QStringLiteral("Saved"));
